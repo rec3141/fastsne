@@ -1,0 +1,5 @@
+data/
+out/
+fastsne
+*.model
+__pycache__/
