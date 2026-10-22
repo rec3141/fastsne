@@ -133,6 +133,41 @@ const vao = gl.createVertexArray();
 gl.bindVertexArray(vao);
 for (const l of Object.values(LOC)) gl.enableVertexAttribArray(l);
 
+// Points blend into a half-float buffer that is copied to the canvas once per frame. Blending straight into the
+// 8-bit canvas rounds at every step: faint points stop adding up once their increment rounds to zero, and where
+// that happens jumps with the alpha value, so brightness was not monotonic in the opacity sliders.
+const hasFloat = !!gl.getExtension("EXT_color_buffer_float");
+const COPY_VS = `#version 300 es
+void main() { vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0); gl_Position = vec4(p, 0.0, 1.0); }`;
+const COPY_FS = `#version 300 es
+precision highp float;
+uniform sampler2D uAcc; out vec4 o;
+void main() { o = vec4(texelFetch(uAcc, ivec2(gl_FragCoord.xy), 0).rgb, 1.0); }`;
+const copyProg = gl.createProgram();
+gl.attachShader(copyProg, shader(gl.VERTEX_SHADER, COPY_VS));
+gl.attachShader(copyProg, shader(gl.FRAGMENT_SHADER, COPY_FS));
+gl.linkProgram(copyProg);
+const copyVao = gl.createVertexArray();
+const acc = { fbo: null, tex: null, w: 0, h: 0 };
+function accTarget(w, h) {
+  if (!hasFloat) return null;
+  if (acc.w !== w || acc.h !== h) {
+    if (acc.tex) { gl.deleteTexture(acc.tex); gl.deleteFramebuffer(acc.fbo); }
+    acc.tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, acc.tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, w, h);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    acc.fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, acc.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, acc.tex, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { gl.bindFramebuffer(gl.FRAMEBUFFER, null); acc.w = -1; return null; }
+    acc.w = w; acc.h = h;
+    gl.activeTexture(gl.TEXTURE0);
+  }
+  return acc.w > 0 ? acc.fbo : null;
+}
+
 let D = null;            // loaded data
 let E = null, L = null;  // active embedding, active layer (metadata; per-point arrays live in D.parts)
 let ei = 0, li = 0;      // their indices
@@ -268,9 +303,25 @@ function draw() {
   resize();
   if (!dirty) return;
   dirty = false;
+  const fbo = accTarget(canvas.width, canvas.height);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0.051, 0.063, 0.09, 1); gl.clear(gl.COLOR_BUFFER_BIT);
-  if (!D) return;
+  if (D) drawPoints();
+  if (fbo) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.disable(gl.BLEND);
+    gl.useProgram(copyProg);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, acc.tex);
+    gl.uniform1i(gl.getUniformLocation(copyProg, "uAcc"), 1);
+    gl.bindVertexArray(copyVao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    // the rest of the page sets point-shader uniforms and the palette texture assuming this state
+    gl.activeTexture(gl.TEXTURE0); gl.useProgram(prog); gl.bindVertexArray(vao);
+  }
+}
+function drawPoints() {
+  gl.useProgram(prog);
   E.view = { ...view };
   // quantised coordinates are scaled by 65534 (65535 marks a missing position)
   const W = canvas.clientWidth, H = canvas.clientHeight, k = 2 * view.ppu, qs = D.missing ? 65535 / 65534 : 1;
