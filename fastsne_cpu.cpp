@@ -775,6 +775,13 @@ static void run_project_cpu(const Opts& o) {
 }
 
 int main(int argc, char** argv) {
+    // OpenMP threads that spin at barriers collapse when other jobs share the CPU (a run that takes a minute
+    // idle took >13 min with 6 of 16 hardware threads busy). libgomp reads OMP_WAIT_POLICY when it loads, so
+    // when it is unset, set it to passive and re-execute (OMP_WAIT_POLICY=active restores spinning).
+    if (!getenv("OMP_WAIT_POLICY")) {
+        setenv("OMP_WAIT_POLICY", "passive", 1);
+        execv("/proc/self/exe", argv);   // only returns on failure: carry on with the default policy
+    }
     Opts o;
     parse_args(argc, argv, o);
     if (o.threads > 0) omp_set_num_threads(o.threads);
