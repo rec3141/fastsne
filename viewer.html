@@ -116,6 +116,7 @@ const U = {}; for (const u of ["uA", "uB", "uSize", "uAlpha", "uPal", "uRound"])
 const vao = gl.createVertexArray();
 
 let D = null;            // loaded data
+const CHUNK = 4 << 20;   // points per draw call
 const view = { cx: 0, cy: 0, ppu: 1 };
 const sel = new Set();
 let dirty = true;
@@ -141,11 +142,11 @@ function load(buf) {
   const [x0, x1, y0, y1] = hdr.bounds;
   D.sx = x1 - x0; D.sy = y1 - y0; D.x0 = x0; D.y0 = y0;
   gl.bindVertexArray(vao);
+  D.attrs = [];
   const attr = (name, arr, int) => {
     const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
     const loc = gl.getAttribLocation(prog, name); gl.enableVertexAttribArray(loc);
-    if (int) gl.vertexAttribIPointer(loc, 1, gl.UNSIGNED_SHORT, 0, 0);
-    else gl.vertexAttribPointer(loc, 1, gl.UNSIGNED_SHORT, true, 0, 0);
+    D.attrs.push({ b, loc, int });
   };
   attr("px", D.x); attr("py", D.y); attr("cat", D.c, true);
   D.palW = 4096; D.palH = Math.ceil(D.cats.length / 4096);
@@ -212,7 +213,16 @@ function draw() {
   gl.uniform1i(U.uRound, size >= 3 ? 1 : 0);
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   gl.bindVertexArray(vao);
-  gl.drawArrays(gl.POINTS, 0, D.n);
+  // draw in chunks: browsers cap vertices per draw call (Firefox: 30M), so each chunk re-points the attributes
+  // at a byte offset and draws from vertex 0
+  for (let s = 0; s < D.n; s += CHUNK) {
+    for (const a of D.attrs) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, a.b);
+      if (a.int) gl.vertexAttribIPointer(a.loc, 1, gl.UNSIGNED_SHORT, 0, 2 * s);
+      else gl.vertexAttribPointer(a.loc, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+    }
+    gl.drawArrays(gl.POINTS, 0, Math.min(CHUNK, D.n - s));
+  }
 }
 (function loop() { draw(); requestAnimationFrame(loop); })();
 
