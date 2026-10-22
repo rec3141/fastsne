@@ -4,7 +4,8 @@
 #                            (portable: a container built on one machine runs on any x86-64; the launcher picks
 #                            the best build for the host)
 #   make gpu                 fastsne: CUDA, one binary for V100 (sm_70), A30/A100 (sm_80), L40S/RTX 40 (sm_89)
-#                            plus PTX for newer GPUs; set CUDA_ARCHS to change, NVCC to pick a toolkit
+#                            plus PTX for newer GPUs; set CUDA_ARCHS to change, NVCC to pick a toolkit,
+#                            CUDA_INC / CUDA_LIB for extra -I / -L, -Xlinker -rpath flags
 #   make native              fastsne_cpu tuned for this machine only (-march=native)
 #   make install PREFIX=/usr/local   installs whatever was built, plus the viewer and tools under share/fastsne
 #
@@ -18,6 +19,8 @@ CPU_FLAGS = -fopenmp -std=c++17 -Wno-psabi
 CPU_LIBS = -lfftw3f_omp -lfftw3f -lm
 FFTW_INC ?=
 FFTW_LIB ?=
+CUDA_INC ?=
+CUDA_LIB ?=
 CUDA_ARCHS ?= 70 80 89
 GENCODE = $(foreach a,$(CUDA_ARCHS),-gencode arch=compute_$(a),code=sm_$(a)) \
           -gencode arch=compute_$(lastword $(CUDA_ARCHS)),code=compute_$(lastword $(CUDA_ARCHS))
@@ -44,7 +47,7 @@ native: fastsne_cpu.cpp common.h
 
 gpu: fastsne
 fastsne: fastsne.cu common.h
-	$(NVCC) -O3 -std=c++14 $(GENCODE) -o $@ $< -lcufft -lcublas
+	$(NVCC) -O3 -std=c++14 $(GENCODE) $(CUDA_INC) -o $@ $< $(CUDA_LIB) -lcufft -lcublas
 
 install:
 	install -d $(PREFIX)/bin $(PREFIX)/share/fastsne/tools
