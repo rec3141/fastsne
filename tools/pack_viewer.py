@@ -1,84 +1,149 @@
 #!/usr/bin/env python3
-"""Pack an embedding (+ optional categories) for viewer.html.
+"""Pack embeddings + colour layers for viewer.html.
 
-    pack_viewer.py emb.tsv out.fsv [--color cats.tsv [--col NAME]] [--title T]
+    pack_viewer.py out.fsv --emb fastsne=emb.tsv [--emb other=table.tsv:tsne_x,tsne_y ...]
+                           [--layer genus=cats.tsv:genus] [--layer gc=table.tsv:gc~num] [--layer depth=table.tsv:depth~log]
+                           [--title T]
+    pack_viewer.py emb.tsv out.fsv --color cats.tsv [--col NAME]       (old form: one embedding, one layer)
 
-emb.tsv: id, x, y (fastsne output). cats.tsv: id in the first column, category in --col (default: second).
-Categories whose name starts with "(" (e.g. "(above genus)") are kept but not given their own colour.
+--emb NAME=FILE[:XCOL,YCOL]   tsv with an id column (first column) and coordinates (default columns x, y).
+                              The first embedding fixes the point set; others are joined by id.
+--layer NAME=FILE:COL[~num|~log]  a colouring. Categorical by default (empty, "NA" and missing are unlabelled;
+                              names starting with "(" get no colour of their own). ~num / ~log bins a numeric
+                              column into 64 linear / logarithmic steps on a colour ramp.
 
-Format: b"FSV1", uint32 header length, JSON header (padded to 4 bytes), then uint16 x[n], uint16 y[n],
-uint16 cat[n]. x, y are quantised over the bounding box. Category 0 = unlabelled. Unlabelled and uncoloured
-points are drawn first; coloured points follow in random order, so each pixel shows roughly its majority
-category (drawing rare categories last would sprinkle them over everything).
+Format FSV2: b"FSV2", uint32 header length, JSON header (padded to 4 bytes), then per embedding uint16 x[n],
+uint16 y[n] (quantised over its bounding box), then per layer uint16 cat[n] (0 = unlabelled). Points are
+shuffled once, so the viewer can draw grey points first and coloured points in random order on top.
 """
 import argparse
 import json
 import struct
+import sys
 
+import matplotlib
 import matplotlib.colors
 import numpy as np
 import pandas as pd
 
 ap = argparse.ArgumentParser()
-ap.add_argument("emb")
-ap.add_argument("out")
+ap.add_argument("pos", nargs="*")
+ap.add_argument("--emb", action="append", default=[])
+ap.add_argument("--layer", action="append", default=[])
 ap.add_argument("--color")
 ap.add_argument("--col")
 ap.add_argument("--title", default="")
 a = ap.parse_args()
-
-e = pd.read_csv(a.emb, sep="\t", dtype={"id": str}, engine="c")
-n = len(e)
-if a.color:
-    c = pd.read_csv(a.color, sep="\t", dtype=str)
-    c = c.rename(columns={c.columns[0]: "id"}).drop_duplicates("id")
-    col = a.col or c.columns[1]
-    v = e[["id"]].merge(c[["id", col]], on="id", how="left")[col]
+if len(a.pos) == 2:          # old form: emb.tsv out.fsv [--color f --col c]
+    a.emb.insert(0, f"t-SNE={a.pos[0]}")
+    if a.color:
+        a.layer.insert(0, f"{a.col or 'category'}={a.color}:{a.col or ''}")
+    out = a.pos[1]
+elif len(a.pos) == 1:
+    out = a.pos[0]
 else:
-    v = pd.Series([None] * n)
-del e["id"]
+    sys.exit("give OUT.fsv (or EMB.tsv OUT.fsv)")
+if not a.emb:
+    sys.exit("need at least one --emb")
 
-vc = v.value_counts()
-names = ["unlabelled"] + list(vc.index)
-counts = [int(v.isna().sum())] + [int(x) for x in vc.values]
-code = v.map({t: i + 1 for i, t in enumerate(vc.index)}).fillna(0).to_numpy().astype(np.int64)
-if len(names) > 65535:
-    raise SystemExit(f"{len(names)} categories; at most 65535 supported")
+_tables = {}
 
-# same vivid palette as render.py, in rank order among coloured categories
-colors = []
-k = 0
-for i, t in enumerate(names):
-    if i == 0:
-        colors.append("#474747")
-    elif str(t).startswith("("):
-        colors.append("#808080")
+
+def table(path):
+    if path not in _tables:
+        t = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
+        t = t.rename(columns={t.columns[0]: "id"}).drop_duplicates("id").set_index("id")
+        _tables[path] = t
+    return _tables[path]
+
+
+def vivid(k):
+    h, s, v = (0.08 + k * 0.618034) % 1, 1.0 - 0.12 * (k % 2), 1.0 - 0.14 * ((k // 2) % 3)
+    return matplotlib.colors.to_hex(matplotlib.colors.hsv_to_rgb((h, s, v)))
+
+
+# embeddings
+ids = None
+embs = []
+for spec in a.emb:
+    name, rest = spec.split("=", 1)
+    path, _, cols = rest.partition(":")
+    xc, yc = cols.split(",") if cols else ("x", "y")
+    t = table(path)
+    if ids is None:
+        ids = t.index
+        rng = np.random.default_rng(1)
+        ids = ids[rng.permutation(len(ids))]
+    xy = t.reindex(ids)[[xc, yc]].to_numpy(np.float64)
+    ok = np.isfinite(xy).all(1)
+    lo, hi = xy[ok].min(0), xy[ok].max(0)
+    q = np.round((xy - lo) / np.maximum(hi - lo, 1e-12) * 65534).clip(0, 65534)
+    q[~ok] = 65535                                  # missing: drawn off-screen by the viewer
+    embs.append({"name": name, "bounds": [lo[0], hi[0], lo[1], hi[1]], "q": q.astype(np.uint16)})
+n = len(ids)
+
+# layers
+layers = []
+for spec in a.layer:
+    name, rest = spec.split("=", 1)
+    path, _, col = rest.rpartition(":")
+    mode = "cat"
+    if "~" in col:
+        col, mode = col.split("~")
+    t = table(path)
+    col = col or t.columns[0]
+    v = t.reindex(ids)[col]
+    if mode in ("num", "log"):
+        x = pd.to_numeric(v, errors="coerce").to_numpy(np.float64)
+        ok = np.isfinite(x) & ((x > 0) if mode == "log" else True)
+        xs = np.log10(x[ok]) if mode == "log" else x[ok]
+        lo, hi = np.percentile(xs, [0.5, 99.5])
+        nb = 64
+        b = np.clip(((xs - lo) / max(hi - lo, 1e-12) * nb).astype(int), 0, nb - 1)
+        code = np.zeros(n, np.int64)
+        code[ok] = b + 1
+        edges = lo + (hi - lo) * np.arange(nb + 1) / nb
+        fmt = (lambda e: f"{10 ** e:,.3g}") if mode == "log" else (lambda e: f"{e:,.3g}")
+        cmap = matplotlib.colormaps["turbo"]
+        counts = np.bincount(code, minlength=nb + 1)
+        cats = [{"name": "missing", "count": int(counts[0]), "color": "#474747"}]
+        for i in range(nb):
+            nm = f"{fmt(edges[i])} – {fmt(edges[i + 1])}"
+            if i == 0: nm = "≤ " + fmt(edges[1])
+            if i == nb - 1: nm = "≥ " + fmt(edges[i])
+            cats.append({"name": nm, "count": int(counts[i + 1]), "color": matplotlib.colors.to_hex(cmap(0.05 + 0.9 * i / (nb - 1)))})
+        layers.append({"name": name, "ordinal": True, "categories": cats, "code": code})
     else:
-        h, s, val = (0.08 + k * 0.618034) % 1, 1.0 - 0.12 * (k % 2), 1.0 - 0.14 * ((k // 2) % 3)
-        colors.append(matplotlib.colors.to_hex(matplotlib.colors.hsv_to_rgb((h, s, val))))
-        k += 1
+        v = v.astype("string").str.strip()
+        v = v.mask(v.isin(["", "NA", "nan", "None", "unclassified"]))
+        vc = v.value_counts()
+        code = v.map({t: i + 1 for i, t in enumerate(vc.index)}).fillna(0).to_numpy().astype(np.int64)
+        cats = [{"name": "unlabelled", "count": int((code == 0).sum()), "color": "#474747"}]
+        k = 0
+        for t_, c_ in zip(vc.index, vc.values):
+            if str(t_).startswith("("):
+                cats.append({"name": str(t_), "count": int(c_), "color": "#808080"})
+            else:
+                cats.append({"name": str(t_), "count": int(c_), "color": vivid(k)}); k += 1
+        layers.append({"name": name, "ordinal": False, "categories": cats, "code": code})
+    if len(layers[-1]["categories"]) > 65535:
+        sys.exit(f"layer {name}: too many categories")
+if not layers:
+    layers.append({"name": "none", "ordinal": False, "categories": [{"name": "all", "count": n, "color": "#c8d2e6"}],
+                   "code": np.zeros(n, np.int64)})
 
-# draw order: unlabelled, then uncoloured groups, then coloured points shuffled
-grey = np.array([i == 0 or str(t).startswith("(") for i, t in enumerate(names)])
-rng = np.random.default_rng(1)
-key = np.where(grey[code], code.astype(np.float64) - 1e9, rng.random(n))
-order = np.argsort(key, kind="stable")
-
-x, y = e.x.to_numpy(np.float64)[order], e.y.to_numpy(np.float64)[order]
-code = code[order]
-xmin, xmax, ymin, ymax = x.min(), x.max(), y.min(), y.max()
-qx = np.round((x - xmin) / max(xmax - xmin, 1e-12) * 65535).astype(np.uint16)
-qy = np.round((y - ymin) / max(ymax - ymin, 1e-12) * 65535).astype(np.uint16)
-
-hdr = json.dumps({"n": n, "bounds": [xmin, xmax, ymin, ymax], "title": a.title,
-                  "categories": [{"name": str(t), "count": cnt, "color": col}
-                                 for t, cnt, col in zip(names, counts, colors)]}).encode()
+hdr = json.dumps({"n": n, "title": a.title,
+                  "embeddings": [{"name": e["name"], "bounds": e["bounds"]} for e in embs],
+                  "layers": [{"name": l["name"], "ordinal": l["ordinal"], "categories": l["categories"]} for l in layers]}).encode()
 hdr += b" " * (-len(hdr) % 4)
-with open(a.out, "wb") as f:
-    f.write(b"FSV1")
+with open(out, "wb") as f:
+    f.write(b"FSV2")
     f.write(struct.pack("<I", len(hdr)))
     f.write(hdr)
-    qx.tofile(f)
-    qy.tofile(f)
-    code.astype(np.uint16).tofile(f)
-print(f"wrote {a.out}: {n} points, {len(names)} categories")
+    for e in embs:
+        e["q"][:, 0].copy().tofile(f)
+        e["q"][:, 1].copy().tofile(f)
+    for l in layers:
+        l["code"].astype(np.uint16).tofile(f)
+print(f"wrote {out}: {n} points, {len(embs)} embeddings, {len(layers)} layers "
+      f"({', '.join(l['name'] + ':' + str(len(l['categories']) - 1) for l in layers)})")

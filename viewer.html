@@ -19,14 +19,17 @@
   #panel.collapsed .body { display: none; }
   .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
   .head h1 { font-size: 14px; margin: 0; flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  button, .filebtn { background: #1e2531; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+  button, .filebtn, select { background: #1e2531; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
     padding: 4px 9px; font: inherit; cursor: pointer; }
-  button:hover, .filebtn:hover { border-color: var(--accent); }
+  button:hover, .filebtn:hover, select:hover { border-color: var(--accent); }
+  select { width: 100%; padding: 5px 6px; }
   .body { display: flex; flex-direction: column; min-height: 0; flex: 1; }
   .sec { padding: 10px 12px; border-bottom: 1px solid var(--line); }
   .stat { color: var(--muted); }
   label.row { display: grid; grid-template-columns: 92px 1fr 34px; align-items: center; gap: 8px; margin: 4px 0; color: var(--muted); }
   label.row output { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+  label.pick { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 8px; margin: 4px 0 6px; color: var(--muted); }
+  label.pick[hidden] { display: none; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
   input[type=search] { width: 100%; background: #0f131b; color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px 8px; font: inherit; }
@@ -51,7 +54,7 @@
 <body>
 <canvas id="c"></canvas>
 <div id="drop"><div><b>fastsne viewer</b><br>Drop a <code>.fsv</code> file here or use <b>Open</b>.<br>
-  Make one with <code>tools/pack_viewer.py emb.tsv out.fsv --color cats.tsv</code>,<br>
+  Make one with <code>tools/pack_viewer.py</code>,<br>
   or serve this folder and open <code>viewer.html?data=out.fsv</code>.</div></div>
 <div id="panel">
   <div class="head">
@@ -62,6 +65,8 @@
   <div class="body">
     <div class="sec">
       <div class="stat" id="stat">No data loaded</div>
+      <label class="pick" id="embRow" hidden>Map <select id="emb"></select></label>
+      <label class="pick" id="layerRow" hidden>Colour by <select id="layer"></select></label>
       <label class="row">Point size <input id="size" type="range" min="0.5" max="10" step="0.5" value="1.5"><output></output></label>
       <label class="row">Opacity <input id="alpha" type="range" min="0.02" max="1" step="0.02" value="0.6"><output></output></label>
       <label class="row">Unlabelled <input id="ualpha" type="range" min="0" max="1" step="0.05" value="0.35"><output></output></label>
@@ -81,15 +86,21 @@ const canvas = $("c");
 const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true });
 if (!gl) { $("drop").innerHTML = "<div>This viewer needs WebGL2.</div>"; throw new Error("no webgl2"); }
 
+// The palette texture holds one RGBA texel per category (rows of 4096); rows from uFlagRow on hold a flag per
+// category (R = 255: grey, drawn in pass 0). Pass 0 draws grey categories, pass 1 coloured ones on top.
 const VS = `#version 300 es
 in float px; in float py; in uint cat;
 uniform vec2 uA, uB; uniform float uSize, uAlpha;
-uniform sampler2D uPal;
+uniform sampler2D uPal; uniform int uFlagRow, uPass; uniform bool uMissing;
 out vec4 vCol;
 void main() {
-  vec4 c = texelFetch(uPal, ivec2(int(cat % 4096u), int(cat / 4096u)), 0);
+  ivec2 t = ivec2(int(cat % 4096u), int(cat / 4096u));
+  vec4 c = texelFetch(uPal, t, 0);
+  bool grey = texelFetch(uPal, t + ivec2(0, uFlagRow), 0).r > 0.5;
   float a = c.a * uAlpha;
-  if (a <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  if (a <= 0.0 || grey != (uPass == 0) || (uMissing && px == 1.0 && py == 1.0)) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return;
+  }
   vCol = vec4(c.rgb * a, a);
   gl_Position = vec4(vec2(px, py) * uA + uB, 0.0, 1.0);
   gl_PointSize = uSize;
@@ -112,74 +123,96 @@ gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
 gl.linkProgram(prog);
 if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
 gl.useProgram(prog);
-const U = {}; for (const u of ["uA", "uB", "uSize", "uAlpha", "uPal", "uRound"]) U[u] = gl.getUniformLocation(prog, u);
+const U = {};
+for (const u of ["uA", "uB", "uSize", "uAlpha", "uPal", "uRound", "uFlagRow", "uPass", "uMissing"]) U[u] = gl.getUniformLocation(prog, u);
+const LOC = { px: gl.getAttribLocation(prog, "px"), py: gl.getAttribLocation(prog, "py"), cat: gl.getAttribLocation(prog, "cat") };
 const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+for (const l of Object.values(LOC)) gl.enableVertexAttribArray(l);
 
 let D = null;            // loaded data
-const CHUNK = 4 << 20;   // points per draw call
+let E = null, L = null;  // active embedding, active layer
+const CHUNK = 4 << 20;   // points per draw call (browsers cap vertices per draw; Firefox: 30M)
 const view = { cx: 0, cy: 0, ppu: 1 };
 const sel = new Set();
 let dirty = true;
 
 function hexToRgb(h) { const v = parseInt(h.slice(1), 16); return [v >> 16 & 255, v >> 8 & 255, v & 255]; }
+function glBuffer(arr) { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW); return b; }
 
 function parse(buf) {
   const dv = new DataView(buf);
-  if (String.fromCharCode(...new Uint8Array(buf, 0, 4)) !== "FSV1") throw new Error("not an FSV1 file");
+  const magic = String.fromCharCode(...new Uint8Array(buf, 0, 4));
+  if (magic !== "FSV1" && magic !== "FSV2") throw new Error("not a .fsv file");
   const hl = dv.getUint32(4, true);
   const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl)));
-  const n = hdr.n, off = 8 + hl;
-  return { hdr, n, x: new Uint16Array(buf, off, n), y: new Uint16Array(buf, off + 2 * n, n), c: new Uint16Array(buf, off + 4 * n, n) };
+  const n = hdr.n; let off = 8 + hl;
+  const arr = () => { const a = new Uint16Array(buf, off, n); off += 2 * n; return a; };
+  if (magic === "FSV1") {   // one embedding, one layer, points pre-sorted
+    const x = arr(), y = arr(), c = arr();
+    return { hdr, n, missing: false, embs: [{ name: "map", bounds: hdr.bounds, x, y }], layers: [{ name: "category", ordinal: false, categories: hdr.categories, c }] };
+  }
+  const embs = hdr.embeddings.map(e => ({ ...e, x: arr(), y: arr() }));
+  const layers = hdr.layers.map(l => ({ ...l, c: arr() }));
+  return { hdr, n, missing: true, embs, layers };
 }
 
 function load(buf) {
   const t0 = performance.now();
   D = parse(buf);
-  const { hdr, n } = D;
-  D.cats = hdr.categories;
-  D.rgb = D.cats.map(c => hexToRgb(c.color));
-  D.grey = D.cats.map((c, i) => i === 0 || c.name.startsWith("("));
-  const [x0, x1, y0, y1] = hdr.bounds;
-  D.sx = x1 - x0; D.sy = y1 - y0; D.x0 = x0; D.y0 = y0;
-  gl.bindVertexArray(vao);
-  D.attrs = [];
-  const attr = (name, arr, int) => {
-    const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
-    const loc = gl.getAttribLocation(prog, name); gl.enableVertexAttribArray(loc);
-    D.attrs.push({ b, loc, int });
-  };
-  attr("px", D.x); attr("py", D.y); attr("cat", D.c, true);
-  D.palW = 4096; D.palH = Math.ceil(D.cats.length / 4096);
-  D.pal = new Uint8Array(D.palW * D.palH * 4);
+  for (const e of D.embs) { e.xb = glBuffer(e.x); e.yb = glBuffer(e.y); const [x0, x1, y0, y1] = e.bounds; Object.assign(e, { x0, y0, sx: x1 - x0, sy: y1 - y0 }); }
+  for (const l of D.layers) {
+    l.cb = glBuffer(l.c);
+    l.rgb = l.categories.map(c => hexToRgb(c.color));
+    l.grey = l.categories.map((c, i) => i === 0 || c.name.startsWith("("));
+  }
   D.tex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, D.tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.uniform1i(U.uPal, 0);
-  sel.clear();
-  updatePalette();
-  $("title").textContent = hdr.title || "fastsne viewer";
-  document.title = hdr.title || "fastsne viewer";
-  const labelled = n - D.cats[0].count;
-  $("stat").textContent = `${n.toLocaleString()} points · ${(D.cats.length - 1).toLocaleString()} categories · ${(100 * labelled / n).toFixed(0)}% labelled`;
+  gl.uniform1i(U.uMissing, D.missing ? 1 : 0);
+  const title = D.hdr.title || "fastsne viewer";
+  $("title").textContent = title; document.title = title;
+  const fill = (selEl, items) => { selEl.textContent = ""; items.forEach((it, i) => selEl.add(new Option(it.name, i))); };
+  fill($("emb"), D.embs); fill($("layer"), D.layers);
+  $("embRow").hidden = D.embs.length < 2; $("layerRow").hidden = D.layers.length < 2;
   $("drop").style.display = "none";
-  resetView();
-  renderList();
-  $("busy").textContent = `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s · indexing for hover…`;
-  setTimeout(buildGrid, 30);
+  setEmbedding(0, true);
+  setLayer(0);
+  $("busy").textContent = `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+}
+
+function setEmbedding(i, reset) {
+  E = D.embs[i];
+  if (reset || !E.view) resetView(); else Object.assign(view, E.view);
+  E.gidx = null; setTimeout(() => buildGrid(E), 30);
+  dirty = true;
+}
+function setLayer(i) {
+  L = D.layers[i];
+  sel.clear();
+  const H = Math.ceil(L.categories.length / 4096);
+  L.palW = 4096; L.palH = H; L.pal = new Uint8Array(4096 * 2 * H * 4);
+  for (let k = 0; k < L.categories.length; k++) if (L.grey[k]) L.pal[4 * (4096 * H + k)] = 255;
+  gl.uniform1i(U.uFlagRow, H);
+  const labelled = D.n - L.categories[0].count;
+  $("stat").textContent = `${D.n.toLocaleString()} points · ${(L.categories.length - 1).toLocaleString()} ${L.ordinal ? "bins" : "categories"} · ${(100 * labelled / D.n).toFixed(0)}% ${L.ordinal ? "with a value" : "labelled"}`;
+  $("q").value = "";
+  updatePalette(); renderList();
 }
 
 function updatePalette() {
-  if (!D) return;
+  if (!L) return;
   const ua = +$("ualpha").value, dim = +$("dim").value, any = sel.size > 0;
-  for (let i = 0; i < D.cats.length; i++) {
-    let [r, g, b] = D.rgb[i], a = 1;
-    if (D.grey[i]) a = ua;
+  for (let i = 0; i < L.categories.length; i++) {
+    let [r, g, b] = L.rgb[i], a = 1;
+    if (L.grey[i]) a = ua;
     if (any && !sel.has(i)) { a = Math.min(a, dim); r = g = b = 150; }
-    D.pal.set([r, g, b, Math.round(a * 255)], 4 * i);
+    L.pal.set([r, g, b, Math.round(a * 255)], 4 * i);
   }
   gl.bindTexture(gl.TEXTURE_2D, D.tex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, D.palW, D.palH, 0, gl.RGBA, gl.UNSIGNED_BYTE, D.pal);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, L.palW, 2 * L.palH, 0, gl.RGBA, gl.UNSIGNED_BYTE, L.pal);
   dirty = true;
 }
 
@@ -190,10 +223,10 @@ function resize() {
 }
 
 function resetView() {
-  if (!D) return;
+  if (!E) return;
   resize();
-  view.cx = D.x0 + D.sx / 2; view.cy = D.y0 + D.sy / 2;
-  view.ppu = 0.95 * Math.min(canvas.clientWidth / D.sx, canvas.clientHeight / D.sy);
+  view.cx = E.x0 + E.sx / 2; view.cy = E.y0 + E.sy / 2;
+  view.ppu = 0.95 * Math.min(canvas.clientWidth / E.sx, canvas.clientHeight / E.sy);
   dirty = true;
 }
 
@@ -204,24 +237,26 @@ function draw() {
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.clearColor(0.051, 0.063, 0.09, 1); gl.clear(gl.COLOR_BUFFER_BIT);
   if (!D) return;
-  const W = canvas.clientWidth, H = canvas.clientHeight, k = 2 * view.ppu;
-  gl.uniform2f(U.uA, D.sx * k / W, D.sy * k / H);
-  gl.uniform2f(U.uB, (D.x0 - view.cx) * k / W, (D.y0 - view.cy) * k / H);
+  E.view = { ...view };
+  // quantised coordinates are scaled by 65534 (65535 marks a missing position)
+  const W = canvas.clientWidth, H = canvas.clientHeight, k = 2 * view.ppu, qs = D.missing ? 65535 / 65534 : 1;
+  gl.uniform2f(U.uA, E.sx * qs * k / W, E.sy * qs * k / H);
+  gl.uniform2f(U.uB, (E.x0 - view.cx) * k / W, (E.y0 - view.cy) * k / H);
   const dpr = window.devicePixelRatio || 1, size = +$("size").value * dpr;
   gl.uniform1f(U.uSize, size);
   gl.uniform1f(U.uAlpha, +$("alpha").value);
   gl.uniform1i(U.uRound, size >= 3 ? 1 : 0);
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   gl.bindVertexArray(vao);
-  // draw in chunks: browsers cap vertices per draw call (Firefox: 30M), so each chunk re-points the attributes
-  // at a byte offset and draws from vertex 0
-  for (let s = 0; s < D.n; s += CHUNK) {
-    for (const a of D.attrs) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, a.b);
-      if (a.int) gl.vertexAttribIPointer(a.loc, 1, gl.UNSIGNED_SHORT, 0, 2 * s);
-      else gl.vertexAttribPointer(a.loc, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+  for (let pass = 0; pass < 2; pass++) {
+    gl.uniform1i(U.uPass, pass);
+    // each chunk re-points the attributes at a byte offset and draws from vertex 0
+    for (let s = 0; s < D.n; s += CHUNK) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, E.xb); gl.vertexAttribPointer(LOC.px, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+      gl.bindBuffer(gl.ARRAY_BUFFER, E.yb); gl.vertexAttribPointer(LOC.py, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+      gl.bindBuffer(gl.ARRAY_BUFFER, L.cb); gl.vertexAttribIPointer(LOC.cat, 1, gl.UNSIGNED_SHORT, 0, 2 * s);
+      gl.drawArrays(gl.POINTS, 0, Math.min(CHUNK, D.n - s));
     }
-    gl.drawArrays(gl.POINTS, 0, Math.min(CHUNK, D.n - s));
   }
 }
 (function loop() { draw(); requestAnimationFrame(loop); })();
@@ -248,23 +283,25 @@ canvas.addEventListener("pointermove", ev => {
 });
 canvas.addEventListener("pointerup", ev => {
   if (drag && !drag.moved && D) {
-    const c = pick(ev.offsetX, ev.offsetY);
-    if (c > 0 && !D.grey[c]) toggle(c, ev.shiftKey || ev.ctrlKey || ev.metaKey);
-    else if (sel.size && !(ev.shiftKey || ev.ctrlKey || ev.metaKey)) { sel.clear(); updatePalette(); renderList(); }  // empty space clears
+    const add = ev.shiftKey || ev.ctrlKey || ev.metaKey, c = pick(ev.offsetX, ev.offsetY);
+    if (c > 0 && !L.grey[c]) toggle(c, add);
+    else if (sel.size && !add) { sel.clear(); updatePalette(); renderList(); }   // empty space clears
   }
   drag = null;
 });
 canvas.addEventListener("pointerleave", () => { $("tip").style.display = "none"; });
 window.addEventListener("resize", () => { dirty = true; });
+window.addEventListener("keydown", ev => {
+  if (ev.key === "Escape" && sel.size && document.activeElement !== $("q")) { sel.clear(); updatePalette(); renderList(); }
+});
 for (const id of ["size", "alpha", "ualpha", "dim"]) {
   const el = $(id), out = el.nextElementSibling;
   const upd = () => { out.textContent = el.value; if (id === "ualpha" || id === "dim") updatePalette(); dirty = true; };
   el.addEventListener("input", upd); upd();
 }
+$("emb").addEventListener("change", ev => setEmbedding(+ev.target.value, false));
+$("layer").addEventListener("change", ev => setLayer(+ev.target.value));
 $("reset").onclick = resetView;
-window.addEventListener("keydown", ev => {
-  if (ev.key === "Escape" && sel.size && document.activeElement !== $("q")) { sel.clear(); updatePalette(); renderList(); }
-});
 $("clear").onclick = () => { sel.clear(); updatePalette(); renderList(); };
 $("fold").onclick = () => { const p = $("panel"); p.classList.toggle("collapsed"); $("fold").textContent = p.classList.contains("collapsed") ? "+" : "–"; };
 $("png").onclick = () => { dirty = true; draw(); const a = document.createElement("a"); a.download = "fastsne.png"; a.href = canvas.toDataURL("image/png"); a.click(); };
@@ -278,22 +315,20 @@ function toggle(i, add) {
 // ---------------- category list ----------------
 function renderList() {
   const box = $("cats"); box.textContent = "";
-  if (!D) return;
-  const q = $("q").value.trim().toLowerCase();
+  if (!L) return;
+  const q = $("q").value.trim().toLowerCase(), cats = L.categories;
   const items = [];
-  for (let i = 0; i < D.cats.length; i++) {
-    if (q && !D.cats[i].name.toLowerCase().includes(q)) continue;
-    items.push(i);
-  }
-  items.sort((a, b) => (sel.has(b) - sel.has(a)) || D.cats[b].count - D.cats[a].count);
+  for (let i = 0; i < cats.length; i++) if (!q || cats[i].name.toLowerCase().includes(q)) items.push(i);
+  // ordinal layers (binned numbers) keep their order; categorical ones go by count
+  items.sort((a, b) => (sel.has(b) - sel.has(a)) || (L.ordinal ? a - b : cats[b].count - cats[a].count));
   const frag = document.createDocumentFragment();
   for (const i of items.slice(0, 400)) {
-    const c = D.cats[i], row = document.createElement("div");
+    const c = cats[i], row = document.createElement("div");
     row.className = "cat" + (sel.has(i) ? " sel" : "");
     row.innerHTML = `<span class="sw" style="background:${c.color}"></span><span class="nm"></span><span class="ct">${c.count.toLocaleString()}</span>`;
     row.querySelector(".nm").textContent = c.name;
     row.title = c.name;
-    if (!D.grey[i]) row.onclick = ev => toggle(i, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+    if (!L.grey[i]) row.onclick = ev => toggle(i, ev.shiftKey || ev.ctrlKey || ev.metaKey);
     else row.style.cursor = "default";
     frag.appendChild(row);
   }
@@ -305,43 +340,45 @@ function renderList() {
 }
 $("q").addEventListener("input", renderList);
 $("q").addEventListener("keydown", ev => {
-  if (ev.key !== "Enter" || !D) return;
+  if (ev.key !== "Enter" || !L) return;
   const q = $("q").value.trim().toLowerCase(); if (!q) return;
   sel.clear();
-  D.cats.forEach((c, i) => { if (!D.grey[i] && c.name.toLowerCase().includes(q)) sel.add(i); });
+  L.categories.forEach((c, i) => { if (!L.grey[i] && c.name.toLowerCase().includes(q)) sel.add(i); });
   updatePalette(); renderList();
 });
 
-// ---------------- hover picking: uniform grid over the quantised coordinates ----------------
+// ---------------- hover picking: uniform grid over the quantised coordinates of the active map ----------------
 const GB = 10, G = 1 << GB, SH = 16 - GB;
-function buildGrid() {
-  const t0 = performance.now(), { n, x, y } = D;
+function buildGrid(e) {
+  if (e.gidx) return;
+  const t0 = performance.now(), n = D.n, { x, y } = e;
   const start = new Uint32Array(G * G + 1);
   for (let i = 0; i < n; i++) start[((y[i] >> SH) << GB | (x[i] >> SH)) + 1]++;
   for (let i = 0; i < G * G; i++) start[i + 1] += start[i];
   const fill = start.slice(0, G * G), idx = new Uint32Array(n);
   for (let i = 0; i < n; i++) idx[fill[(y[i] >> SH) << GB | (x[i] >> SH)]++] = i;
-  D.gstart = start; D.gidx = idx;
+  e.gstart = start; e.gidx = idx;
   $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds; Esc or empty space clears)`;
 }
 function pick(mx, my) {
-  if (!D || !D.gidx) return -1;
+  if (!E || !E.gidx) return -1;
+  const qsc = D.missing ? 65534 : 65535;
   const [dx, dy] = toData(mx, my);
-  const qx = (dx - D.x0) / D.sx * 65535, qy = (dy - D.y0) / D.sy * 65535;
+  const qx = (dx - E.x0) / E.sx * qsc, qy = (dy - E.y0) / E.sy * qsc;
   const r = Math.max(4, +$("size").value * 1.5) / view.ppu;     // pick radius in data units
-  const rqx = r / D.sx * 65535, rqy = r / D.sy * 65535;
+  const rqx = r / E.sx * qsc, rqy = r / E.sy * qsc;
   const cx0 = Math.max(0, (qx - rqx) >> SH), cx1 = Math.min(G - 1, (qx + rqx) >> SH);
   const cy0 = Math.max(0, (qy - rqy) >> SH), cy1 = Math.min(G - 1, (qy + rqy) >> SH);
   let best = -1, bd = 1, bi = -1, scanned = 0;
   for (let cy = cy0; cy <= cy1 && scanned < 2e6; cy++) for (let cx = cx0; cx <= cx1; cx++) {
     const c = cy << GB | cx;
-    for (let k = D.gstart[c]; k < D.gstart[c + 1]; k++) {
-      const i = D.gidx[k]; scanned++;
-      const cat = D.c[i];
-      if (D.grey[cat] && D.pal[4 * cat + 3] < 8) continue;      // hidden unlabelled; dimmed genera stay pickable
-      const ex = (D.x[i] - qx) / rqx, ey = (D.y[i] - qy) / rqy, d = ex * ex + ey * ey;
+    for (let k = E.gstart[c]; k < E.gstart[c + 1]; k++) {
+      const i = E.gidx[k]; scanned++;
+      const cat = L.c[i];
+      if (L.grey[cat] && L.pal[4 * cat + 3] < 8) continue;      // hidden unlabelled; dimmed categories stay pickable
+      const ex = (E.x[i] - qx) / rqx, ey = (E.y[i] - qy) / rqy, d = ex * ex + ey * ey;
       // prefer coloured points, then later-drawn (on top), then nearer
-      if (d < 1 && (best < 0 || D.grey[best] && !D.grey[cat] || (D.grey[best] === D.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {
+      if (d < 1 && (best < 0 || L.grey[best] && !L.grey[cat] || (L.grey[best] === L.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {
         best = cat; bd = d; bi = i;
       }
     }
@@ -353,8 +390,9 @@ function hover(ev) {
   const now = performance.now(); if (now - hoverT < 40) return; hoverT = now;
   const c = pick(ev.offsetX, ev.offsetY), tip = $("tip");
   if (c < 0) { tip.style.display = "none"; return; }
-  tip.innerHTML = `<span class="sw" style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${D.cats[c].color}"></span> `;
-  tip.append(D.cats[c].name, ` · ${D.cats[c].count.toLocaleString()} reads`);
+  const cat = L.categories[c];
+  tip.innerHTML = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${cat.color}"></span> `;
+  tip.append(D.layers.length > 1 ? `${L.name}: ` : "", cat.name, ` · ${cat.count.toLocaleString()}`);
   tip.style.display = "block";
   const x = Math.min(ev.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
   tip.style.left = x + "px"; tip.style.top = (ev.clientY + 14) + "px";

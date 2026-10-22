@@ -38,20 +38,30 @@ Reading 20 GB of text takes about 7 s once it's in the page cache.
 ## Interactive viewer (WebGL2, tested with 30M points)
 
 ```
-python3 tools/pack_viewer.py tsne.tsv tsne.fsv --color genus.tsv --title "my reads"   # 6 bytes/point
-python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1:8765/viewer.html?data=tsne.fsv
+# one map, one colouring
+python3 tools/pack_viewer.py tsne.tsv tsne.fsv --color genus.tsv --title "my reads"      # 6 bytes/point
+
+# several maps and colourings in one file (switch with the Map / Colour by menus)
+python3 tools/microscape_contigs.py https://microscape.app/marine-coassembly-flye/ contigs.tsv.gz --cache ms/
+python3 tools/pack_viewer.py contigs.fsv --title "co-assembly" \
+    --emb "fastsne=contigs_tsne.tsv" --emb "microscape UMAP=contigs.tsv.gz:umap_x,umap_y" \
+    --layer "kaiju genus=contigs.tsv.gz:kaiju_genus" --layer "bin=contigs.tsv.gz:bin" \
+    --layer "GC=contigs.tsv.gz:gc~num" --layer "depth=contigs.tsv.gz:depth~log"
+
+python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1:8765/viewer.html?data=contigs.fsv
 ```
 
+`--layer NAME=FILE:COL` is categorical (empty and `NA` count as unlabelled). `~num` / `~log` bins a numeric column into 64 linear / log steps on a colour ramp.
+
 `viewer.html` is a single file with no dependencies. You can also open it directly and drop a `.fsv` file onto it. It draws every point:
-- 30M points take about 47 ms per frame on a GV100, and the 180 MB file loads in a few seconds.
+- 30M points take about 47 ms per frame on a GV100, drawn in 4M-point chunks for Firefox's per-draw limit.
+- Grey points are drawn first, then coloured points in random order, so each pixel shows roughly its majority category.
 - Scroll to zoom, drag to pan.
 - Hover shows the category under the cursor.
 - Click a point or a list entry to highlight that category (dimmed categories stay clickable); shift-click adds more. Esc or a click on empty space clears the selection.
 - Search box: Enter selects all matching categories.
 - Sliders for point size, opacity, unlabelled opacity and how far non-selected points are dimmed.
 - Save PNG.
-
-Labelled points are drawn in random order above the unlabelled ones, so each pixel shows roughly its majority category.
 
 ## Sample + project (more points than fit in memory)
 
