@@ -35,6 +35,19 @@ GPU memory is about 0.9 KB per point (30M peaked at 28 GB of the GV100's 32 GB).
 
 Reading 20 GB of text takes about 7 s once it's in the page cache.
 
+## CPU version (`fastsne_cpu.cpp`, OpenMP + FFTW)
+
+Same pipeline and options (no `--project` yet). On Grex:
+
+```
+module load arch/avx512 gcc/13.2.0 fftw/3.3.10
+g++ -O3 -march=native -fopenmp -std=c++17 -o fastsne_cpu fastsne_cpu.cpp -lfftw3f_omp -lfftw3f -lm
+./fastsne_cpu -i reads.fsb -o tsne.tsv --dedup 2
+```
+
+On a 192-core genoa node: 1.55M contigs in 57 s; 9.36M reads in 202 s (14.6 GB RAM), before the
+per-thread splat fix for the early iterations.
+
 ## Interactive viewer (WebGL2, tested with 30M points)
 
 ```
