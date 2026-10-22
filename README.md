@@ -45,8 +45,17 @@ g++ -O3 -march=native -fopenmp -std=c++17 -o fastsne_cpu fastsne_cpu.cpp -lfftw3
 ./fastsne_cpu -i reads.fsb -o tsne.tsv --dedup 2
 ```
 
-On a 192-core genoa node: 1.55M contigs in 57 s; 9.36M reads in 202 s (14.6 GB RAM), before the
-per-thread splat fix for the early iterations.
+| Grex node | 1.55M contigs | 9.36M reads (`--dedup 2`) |
+|---|---|---|
+| genoa, 192 cores (CPU) | 57 s | 103 s, 14.6 GB RAM |
+| lgpu, L40S 48 GB | 19 s | 60 s, 8.2 GB GPU |
+
+kNN recall@48 on the contigs (1000 queries): 0.89 on both CPU and GPU (32 probes + 1 refinement round, the
+default for both). On the CPU, 16 probes give 0.80 and 8 probes without refinement 0.64.
+
+GPU build on Grex: `module load arch/avx2 gcc/13.2.0 cuda/12.4.1; export PATH=$CUDA_HOME/bin:$PATH`, then
+`nvcc -O3 -std=c++14 -gencode arch=compute_70,code=sm_70 -gencode arch=compute_80,code=sm_80
+-gencode arch=compute_89,code=sm_89 -o fastsne fastsne.cu -lcufft -lcublas` (V100, A30, L40S in one binary).
 
 ## Interactive viewer (WebGL2, tested with 173M points)
 

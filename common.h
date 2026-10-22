@@ -42,8 +42,8 @@ struct Opts {
     float perplexity = -1;      // default k/3
     bool uniform = false;
     int clusters = 0;           // 0 = auto
-    int nprobe = -1;            // -1: 32 on GPU, CPU default below
-    int refine = -1;            // NN-descent rounds (-1: 1 on GPU, 0 on CPU)
+    int nprobe = -1;            // -1: 32
+    int refine = -1;            // NN-descent rounds (-1: 1)
     int refine_a = 16;          // neighbours (and their neighbours) tried per round
     int iters = 750;
     int ee_iters = 250;

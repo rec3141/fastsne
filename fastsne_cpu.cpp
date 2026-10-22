@@ -618,8 +618,8 @@ int main(int argc, char** argv) {
     parse_args(argc, argv, o);
     if (!o.project.empty()) { fprintf(stderr, "fastsne_cpu: --project is GPU-only for now; use fastsne\n"); return 1; }
     if (o.threads > 0) omp_set_num_threads(o.threads);
-    if (o.nprobe < 0) o.nprobe = 8;
-    if (o.refine < 0) o.refine = 0;
+    if (o.nprobe < 0) o.nprobe = 32;
+    if (o.refine < 0) o.refine = 1;
     if (o.cluster_size < 0) o.cluster_size = 1000;
     fftwf_init_threads();
     fftwf_plan_with_nthreads(omp_get_max_threads());
