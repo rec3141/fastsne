@@ -3,7 +3,9 @@
 GPU t-SNE for very large TNF tables (nanopore reads, contigs). Single CUDA binary: needs only the CUDA toolkit (cuFFT, cuBLAS, thrust).
 
 ```
-nvcc -O3 -arch=sm_70 -std=c++14 -o fastsne fastsne.cu -lcufft -lcublas      # sm_80 for A100, etc.
+make gpu                    # fastsne (CUDA): V100, A30/A100, L40S + PTX; CUDA_ARCHS="70 80 89" to change
+make cpu                    # fastsne_cpu (OpenMP + FFTW): AVX-512 / AVX2 / generic builds behind a launcher
+make install PREFIX=/usr/local      # binaries, plus viewer.html and tools/ under share/fastsne
 ./fastsne -i tnf.tsv -o tsne.tsv --dedup 2
 ./fastsne -i @list_of_lrn_files.txt -o tsne.tsv --dedup 2                    # many files
 python3 render.py tsne.tsv tsne.png --color labels.tsv --cat                 # quick PNG
@@ -41,7 +43,7 @@ Same pipeline, options and model files (a model saved by either build can be pro
 
 ```
 module load arch/avx512 gcc/13.2.0 fftw/3.3.10
-g++ -O3 -march=native -fopenmp -std=c++17 -o fastsne_cpu fastsne_cpu.cpp -lfftw3f_omp -lfftw3f -lm
+make native                 # or `make cpu` for a portable build
 ./fastsne_cpu -i reads.fsb -o tsne.tsv --dedup 2
 ```
 

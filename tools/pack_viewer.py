@@ -3,7 +3,7 @@
 
     pack_viewer.py out.fsv --emb fastsne=emb.tsv [--emb other=table.tsv:tsne_x,tsne_y ...]
                            [--layer genus=cats.tsv:genus] [--layer gc=table.tsv:gc~num] [--layer depth=table.tsv:depth~log]
-                           [--title T] [--page-size N]
+                           [--title T] [--page-size N] [--kind FILE:COL]
     pack_viewer.py emb.tsv out.fsv --color cats.tsv [--col NAME]       (old form: one embedding, one layer)
 
 --emb NAME=FILE[:XCOL,YCOL]   tsv with an id column (first column) and coordinates (default columns x, y).
@@ -15,6 +15,9 @@
 --page-size N  write OUT.json plus OUT.p000.fsv, OUT.p001.fsv, ... of N points each (OUT given as X.json or X).
               viewer.html?data=X.json loads them one after another and draws each as it arrives, so very large
               sets need not fit one browser allocation. Every page carries the full header (with "total").
+--kind FILE:COL  rows whose COL is "reference" (points embedded directly) and the rest (points projected onto them,
+              e.g. fastsne --project) go to separate pages, reference pages first; the viewer can hide projected
+              pages. Implies paging (default page size 25M).
 
 Format FSV2: b"FSV2", uint32 header length, JSON header (padded to 4 bytes), then per embedding uint16 x[n],
 uint16 y[n] (quantised over its bounding box), then per layer uint16 cat[n] (0 = unlabelled). Points are
@@ -38,6 +41,7 @@ ap.add_argument("--color")
 ap.add_argument("--col")
 ap.add_argument("--title", default="")
 ap.add_argument("--page-size", type=int, default=0)
+ap.add_argument("--kind")
 a = ap.parse_args()
 if len(a.pos) == 2:          # old form: emb.tsv out.fsv [--color f --col c]
     a.emb.insert(0, f"t-SNE={a.pos[0]}")
@@ -79,6 +83,14 @@ for spec in a.emb:
         ids = t.index
         rng = np.random.default_rng(1)
         ids = ids[rng.permutation(len(ids))]
+        nref = None
+        if a.kind:
+            # reference rows first, each group keeps its shuffled order
+            kpath, _, kcol = a.kind.rpartition(":")
+            isref = (table(kpath).reindex(ids)[kcol].astype("string") == "reference").to_numpy(dtype=bool, na_value=False)
+            ids = ids[np.r_[np.flatnonzero(isref), np.flatnonzero(~isref)]]
+            nref = int(isref.sum())
+            a.page_size = a.page_size or 25_000_000
     xy = t.reindex(ids)[[xc, yc]].to_numpy(np.float64)
     ok = np.isfinite(xy).all(1)
     lo, hi = xy[ok].min(0), xy[ok].max(0)
@@ -157,11 +169,20 @@ def write_fsv(path, lo, hi):
 if a.page_size > 0:
     import os
     stem = out[:-5] if out.endswith(".json") else out
-    pages = [f"{stem}.p{k:03d}.fsv" for k in range((n + a.page_size - 1) // a.page_size)]
-    for k, pg in enumerate(pages):
-        write_fsv(pg, k * a.page_size, min(n, (k + 1) * a.page_size))
+
+    def split(lo, hi):
+        k = max(1, -(-(hi - lo) // a.page_size))
+        e = np.linspace(lo, hi, k + 1).round().astype(int)
+        return [(int(p), int(q)) for p, q in zip(e[:-1], e[1:]) if q > p]
+    ranges = [(r, "") for r in split(0, n)] if nref is None else \
+        [(r, "reference") for r in split(0, nref)] + [(r, "projected") for r in split(nref, n)]
+    pages = [f"{stem}.p{k:03d}.fsv" for k in range(len(ranges))]
+    entries = []
+    for pg, ((lo, hi), kind) in zip(pages, ranges):
+        write_fsv(pg, lo, hi)
+        entries.append({"file": os.path.basename(pg), "kind": kind} if kind else os.path.basename(pg))
     with open(stem + ".json", "w") as f:
-        json.dump({"format": "FSV2 pages", "total": n, "pages": [os.path.basename(p) for p in pages]}, f)
+        json.dump({"format": "FSV2 pages", "total": n, "pages": entries}, f)
     out = f"{stem}.json + {len(pages)} pages"
 else:
     write_fsv(out, 0, n)

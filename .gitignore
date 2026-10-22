@@ -4,3 +4,6 @@ fastsne
 *.model
 __pycache__/
 fastsne_cpu
+fastsne_cpu.avx512
+fastsne_cpu.avx2
+fastsne_cpu.generic
