@@ -3,7 +3,7 @@
 
     pack_viewer.py out.fsv --emb fastsne=emb.tsv [--emb other=table.tsv:tsne_x,tsne_y ...]
                            [--layer genus=cats.tsv:genus] [--layer gc=table.tsv:gc~num] [--layer depth=table.tsv:depth~log]
-                           [--title T]
+                           [--title T] [--page-size N]
     pack_viewer.py emb.tsv out.fsv --color cats.tsv [--col NAME]       (old form: one embedding, one layer)
 
 --emb NAME=FILE[:XCOL,YCOL]   tsv with an id column (first column) and coordinates (default columns x, y).
@@ -11,6 +11,10 @@
 --layer NAME=FILE:COL[~num|~log]  a colouring. Categorical by default (empty, "NA" and missing are unlabelled;
                               names starting with "(" get no colour of their own). ~num / ~log bins a numeric
                               column into 64 linear / logarithmic steps on a colour ramp.
+
+--page-size N  write OUT.json plus OUT.p000.fsv, OUT.p001.fsv, ... of N points each (OUT given as X.json or X).
+              viewer.html?data=X.json loads them one after another and draws each as it arrives, so very large
+              sets need not fit one browser allocation. Every page carries the full header (with "total").
 
 Format FSV2: b"FSV2", uint32 header length, JSON header (padded to 4 bytes), then per embedding uint16 x[n],
 uint16 y[n] (quantised over its bounding box), then per layer uint16 cat[n] (0 = unlabelled). Points are
@@ -33,6 +37,7 @@ ap.add_argument("--layer", action="append", default=[])
 ap.add_argument("--color")
 ap.add_argument("--col")
 ap.add_argument("--title", default="")
+ap.add_argument("--page-size", type=int, default=0)
 a = ap.parse_args()
 if len(a.pos) == 2:          # old form: emb.tsv out.fsv [--color f --col c]
     a.emb.insert(0, f"t-SNE={a.pos[0]}")
@@ -132,18 +137,33 @@ if not layers:
     layers.append({"name": "none", "ordinal": False, "categories": [{"name": "all", "count": n, "color": "#c8d2e6"}],
                    "code": np.zeros(n, np.int64)})
 
-hdr = json.dumps({"n": n, "title": a.title,
-                  "embeddings": [{"name": e["name"], "bounds": e["bounds"]} for e in embs],
-                  "layers": [{"name": l["name"], "ordinal": l["ordinal"], "categories": l["categories"]} for l in layers]}).encode()
-hdr += b" " * (-len(hdr) % 4)
-with open(out, "wb") as f:
-    f.write(b"FSV2")
-    f.write(struct.pack("<I", len(hdr)))
-    f.write(hdr)
-    for e in embs:
-        e["q"][:, 0].copy().tofile(f)
-        e["q"][:, 1].copy().tofile(f)
-    for l in layers:
-        l["code"].astype(np.uint16).tofile(f)
+def write_fsv(path, lo, hi):
+    """points lo..hi-1 as one FSV2 file; category counts in the header always cover all n points"""
+    hdr = json.dumps({"n": hi - lo, "total": n, "title": a.title,
+                      "embeddings": [{"name": e["name"], "bounds": e["bounds"]} for e in embs],
+                      "layers": [{"name": l["name"], "ordinal": l["ordinal"], "categories": l["categories"]} for l in layers]}).encode()
+    hdr += b" " * (-len(hdr) % 4)
+    with open(path, "wb") as f:
+        f.write(b"FSV2")
+        f.write(struct.pack("<I", len(hdr)))
+        f.write(hdr)
+        for e in embs:
+            e["q"][lo:hi, 0].copy().tofile(f)
+            e["q"][lo:hi, 1].copy().tofile(f)
+        for l in layers:
+            l["code"][lo:hi].astype(np.uint16).tofile(f)
+
+
+if a.page_size > 0:
+    import os
+    stem = out[:-5] if out.endswith(".json") else out
+    pages = [f"{stem}.p{k:03d}.fsv" for k in range((n + a.page_size - 1) // a.page_size)]
+    for k, pg in enumerate(pages):
+        write_fsv(pg, k * a.page_size, min(n, (k + 1) * a.page_size))
+    with open(stem + ".json", "w") as f:
+        json.dump({"format": "FSV2 pages", "total": n, "pages": [os.path.basename(p) for p in pages]}, f)
+    out = f"{stem}.json + {len(pages)} pages"
+else:
+    write_fsv(out, 0, n)
 print(f"wrote {out}: {n} points, {len(embs)} embeddings, {len(layers)} layers "
       f"({', '.join(l['name'] + ':' + str(len(l['categories']) - 1) for l in layers)})")

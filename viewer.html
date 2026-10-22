@@ -131,7 +131,8 @@ gl.bindVertexArray(vao);
 for (const l of Object.values(LOC)) gl.enableVertexAttribArray(l);
 
 let D = null;            // loaded data
-let E = null, L = null;  // active embedding, active layer
+let E = null, L = null;  // active embedding, active layer (metadata; per-point arrays live in D.parts)
+let ei = 0, li = 0;      // their indices
 const CHUNK = 4 << 20;   // points per draw call (browsers cap vertices per draw; Firefox: 30M)
 const view = { cx: 0, cy: 0, ppu: 1 };
 const sel = new Set();
@@ -157,12 +158,31 @@ function parse(buf) {
   return { hdr, n, missing: true, embs, layers };
 }
 
+// one page of points: its own arrays and GL buffers; the header (maps, bounds, categories) is shared by all pages
+function makePart(p) {
+  return {
+    n: p.n,
+    embs: p.embs.map(e => ({ x: e.x, y: e.y, xb: glBuffer(e.x), yb: glBuffer(e.y), gidx: null })),
+    layers: p.layers.map(l => ({ c: l.c, cb: glBuffer(l.c) })),
+  };
+}
+function addPage(buf) {
+  const p = parse(buf);
+  if (p.embs.length !== D.embs.length || p.layers.length !== D.layers.length) throw new Error("page does not match the first page");
+  const part = makePart(p);
+  if (gl.getError() === gl.OUT_OF_MEMORY) throw new Error("GPU out of memory");
+  D.parts.push(part); D.n += part.n;
+  if (E) setTimeout(() => buildGrid(ei), 30);
+  showStat(); dirty = true;
+}
+
 function load(buf) {
   const t0 = performance.now();
-  D = parse(buf);
-  for (const e of D.embs) { e.xb = glBuffer(e.x); e.yb = glBuffer(e.y); const [x0, x1, y0, y1] = e.bounds; Object.assign(e, { x0, y0, sx: x1 - x0, sy: y1 - y0 }); }
+  const p = parse(buf);
+  D = { hdr: p.hdr, n: p.n, total: p.hdr.total || p.n, missing: p.missing, embs: p.embs, layers: p.layers, parts: [makePart(p)] };
+  for (const e of D.embs) { delete e.x; delete e.y; const [x0, x1, y0, y1] = e.bounds; Object.assign(e, { x0, y0, sx: x1 - x0, sy: y1 - y0 }); }
   for (const l of D.layers) {
-    l.cb = glBuffer(l.c);
+    delete l.c;
     l.rgb = l.categories.map(c => hexToRgb(c.color));
     l.grey = l.categories.map((c, i) => i === 0 || c.name.startsWith("("));
   }
@@ -184,20 +204,26 @@ function load(buf) {
 }
 
 function setEmbedding(i, reset) {
-  E = D.embs[i];
+  ei = i; E = D.embs[i];
   if (reset || !E.view) resetView(); else Object.assign(view, E.view);
-  E.gidx = null; setTimeout(() => buildGrid(E), 30);
+  setTimeout(() => buildGrid(i), 30);
   dirty = true;
 }
+function showStat() {
+  if (!L) return;
+  // category counts in the header cover every page
+  const labelled = D.total - L.categories[0].count;
+  const pts = D.n < D.total ? `${D.n.toLocaleString()} of ${D.total.toLocaleString()} points (${D.parts.length} pages)` : `${D.n.toLocaleString()} points`;
+  $("stat").textContent = `${pts} · ${(L.categories.length - 1).toLocaleString()} ${L.ordinal ? "bins" : "categories"} · ${(100 * labelled / D.total).toFixed(0)}% ${L.ordinal ? "with a value" : "labelled"}`;
+}
 function setLayer(i) {
-  L = D.layers[i];
+  li = i; L = D.layers[i];
   sel.clear();
   const H = Math.ceil(L.categories.length / 4096);
   L.palW = 4096; L.palH = H; L.pal = new Uint8Array(4096 * 2 * H * 4);
   for (let k = 0; k < L.categories.length; k++) if (L.grey[k]) L.pal[4 * (4096 * H + k)] = 255;
   gl.uniform1i(U.uFlagRow, H);
-  const labelled = D.n - L.categories[0].count;
-  $("stat").textContent = `${D.n.toLocaleString()} points · ${(L.categories.length - 1).toLocaleString()} ${L.ordinal ? "bins" : "categories"} · ${(100 * labelled / D.n).toFixed(0)}% ${L.ordinal ? "with a value" : "labelled"}`;
+  showStat();
   $("q").value = "";
   updatePalette(); renderList();
 }
@@ -251,11 +277,14 @@ function draw() {
   for (let pass = 0; pass < 2; pass++) {
     gl.uniform1i(U.uPass, pass);
     // each chunk re-points the attributes at a byte offset and draws from vertex 0
-    for (let s = 0; s < D.n; s += CHUNK) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, E.xb); gl.vertexAttribPointer(LOC.px, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
-      gl.bindBuffer(gl.ARRAY_BUFFER, E.yb); gl.vertexAttribPointer(LOC.py, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
-      gl.bindBuffer(gl.ARRAY_BUFFER, L.cb); gl.vertexAttribIPointer(LOC.cat, 1, gl.UNSIGNED_SHORT, 0, 2 * s);
-      gl.drawArrays(gl.POINTS, 0, Math.min(CHUNK, D.n - s));
+    for (const part of D.parts) {
+      const pe = part.embs[ei], pl = part.layers[li];
+      for (let s = 0; s < part.n; s += CHUNK) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, pe.xb); gl.vertexAttribPointer(LOC.px, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+        gl.bindBuffer(gl.ARRAY_BUFFER, pe.yb); gl.vertexAttribPointer(LOC.py, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
+        gl.bindBuffer(gl.ARRAY_BUFFER, pl.cb); gl.vertexAttribIPointer(LOC.cat, 1, gl.UNSIGNED_SHORT, 0, 2 * s);
+        gl.drawArrays(gl.POINTS, 0, Math.min(CHUNK, part.n - s));
+      }
     }
   }
 }
@@ -349,19 +378,27 @@ $("q").addEventListener("keydown", ev => {
 
 // ---------------- hover picking: uniform grid over the quantised coordinates of the active map ----------------
 const GB = 10, G = 1 << GB, SH = 16 - GB;
-function buildGrid(e) {
-  if (e.gidx) return;
-  const t0 = performance.now(), n = D.n, { x, y } = e;
+function buildGrid(m) {
+  const t0 = performance.now();
+  let built = false;
+  for (const part of D.parts) {
+    const e = part.embs[m];
+    if (e.gidx) continue;
+    gridPart(e, part.n); built = true;
+  }
+  if (built && m === ei) $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds; Esc or empty space clears)`;
+}
+function gridPart(e, n) {
+  const { x, y } = e;
   const start = new Uint32Array(G * G + 1);
   for (let i = 0; i < n; i++) start[((y[i] >> SH) << GB | (x[i] >> SH)) + 1]++;
   for (let i = 0; i < G * G; i++) start[i + 1] += start[i];
   const fill = start.slice(0, G * G), idx = new Uint32Array(n);
   for (let i = 0; i < n; i++) idx[fill[(y[i] >> SH) << GB | (x[i] >> SH)]++] = i;
   e.gstart = start; e.gidx = idx;
-  $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds; Esc or empty space clears)`;
 }
 function pick(mx, my) {
-  if (!E || !E.gidx) return -1;
+  if (!E) return -1;
   const qsc = D.missing ? 65534 : 65535;
   const [dx, dy] = toData(mx, my);
   const qx = (dx - E.x0) / E.sx * qsc, qy = (dy - E.y0) / E.sy * qsc;
@@ -369,19 +406,24 @@ function pick(mx, my) {
   const rqx = r / E.sx * qsc, rqy = r / E.sy * qsc;
   const cx0 = Math.max(0, (qx - rqx) >> SH), cx1 = Math.min(G - 1, (qx + rqx) >> SH);
   const cy0 = Math.max(0, (qy - rqy) >> SH), cy1 = Math.min(G - 1, (qy + rqy) >> SH);
-  let best = -1, bd = 1, bi = -1, scanned = 0;
-  for (let cy = cy0; cy <= cy1 && scanned < 2e6; cy++) for (let cx = cx0; cx <= cx1; cx++) {
-    const c = cy << GB | cx;
-    for (let k = E.gstart[c]; k < E.gstart[c + 1]; k++) {
-      const i = E.gidx[k]; scanned++;
-      const cat = L.c[i];
-      if (L.grey[cat] && L.pal[4 * cat + 3] < 8) continue;      // hidden unlabelled; dimmed categories stay pickable
-      const ex = (E.x[i] - qx) / rqx, ey = (E.y[i] - qy) / rqy, d = ex * ex + ey * ey;
-      // prefer coloured points, then later-drawn (on top), then nearer
-      if (d < 1 && (best < 0 || L.grey[best] && !L.grey[cat] || (L.grey[best] === L.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {
-        best = cat; bd = d; bi = i;
+  let best = -1, bd = 1, bi = -1, scanned = 0, base = 0;
+  for (const part of D.parts) {
+    const pe = part.embs[ei], pc = part.layers[li].c;
+    if (!pe.gidx) { base += part.n; continue; }
+    for (let cy = cy0; cy <= cy1 && scanned < 2e6; cy++) for (let cx = cx0; cx <= cx1; cx++) {
+      const c = cy << GB | cx;
+      for (let k = pe.gstart[c]; k < pe.gstart[c + 1]; k++) {
+        const j = pe.gidx[k], i = base + j; scanned++;
+        const cat = pc[j];
+        if (L.grey[cat] && L.pal[4 * cat + 3] < 8) continue;      // hidden unlabelled; dimmed categories stay pickable
+        const ex = (pe.x[j] - qx) / rqx, ey = (pe.y[j] - qy) / rqy, d = ex * ex + ey * ey;
+        // prefer coloured points, then later-drawn (on top: later pages draw last), then nearer
+        if (d < 1 && (best < 0 || L.grey[best] && !L.grey[cat] || (L.grey[best] === L.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {
+          best = cat; bd = d; bi = i;
+        }
       }
     }
+    base += part.n;
   }
   return best;
 }
@@ -408,11 +450,32 @@ const drop = $("drop");
 window.addEventListener("dragover", ev => { ev.preventDefault(); drop.classList.add("over"); });
 window.addEventListener("dragleave", () => drop.classList.remove("over"));
 window.addEventListener("drop", ev => { ev.preventDefault(); drop.classList.remove("over"); if (ev.dataTransfer.files[0]) readFile(ev.dataTransfer.files[0]); });
-const url = new URLSearchParams(location.search).get("data");
+const params = new URLSearchParams(location.search), url = params.get("data");
+const getBuf = u => fetch(u).then(r => { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.arrayBuffer(); });
+// paged data (pack_viewer.py --page-size): X.json lists X.pNNN.fsv; pages load one after another and each is drawn
+// as soon as it arrives, so a browser that runs out of memory still shows the pages it could hold (&pages=N caps it)
+async function loadPaged(u) {
+  const idx = await (await fetch(u)).json();
+  const dir = u.slice(0, u.lastIndexOf("/") + 1);
+  const np = Math.min(idx.pages.length, +(params.get("pages") || idx.pages.length));
+  for (let k = 0; k < np; k++) {
+    $("busy").textContent = `fetching page ${k + 1} of ${np}…`;
+    let buf;
+    try {
+      buf = await getBuf(dir + idx.pages[k]);
+      if (k === 0) load(buf); else addPage(buf);
+    } catch (e) {
+      if (k === 0) throw e;
+      $("busy").textContent = `stopped after ${k} of ${np} pages: ${e.message}`; return;
+    }
+    buf = null;
+    await new Promise(r => setTimeout(r, 0));   // let the new page draw before fetching the next
+  }
+  $("busy").textContent = `loaded ${np} page${np > 1 ? "s" : ""} · ${D.n.toLocaleString()} points`;
+}
 if (url) {
   $("busy").textContent = `fetching ${url}…`;
-  fetch(url).then(r => { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.arrayBuffer(); })
-    .then(load).catch(e => { $("busy").textContent = "error: " + e.message; });
+  (url.endsWith(".json") ? loadPaged(url) : getBuf(url).then(load)).catch(e => { $("busy").textContent = "error: " + e.message; });
 }
 </script>
 </body>

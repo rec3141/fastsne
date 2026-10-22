@@ -48,7 +48,7 @@ g++ -O3 -march=native -fopenmp -std=c++17 -o fastsne_cpu fastsne_cpu.cpp -lfftw3
 On a 192-core genoa node: 1.55M contigs in 57 s; 9.36M reads in 202 s (14.6 GB RAM), before the
 per-thread splat fix for the early iterations.
 
-## Interactive viewer (WebGL2, tested with 30M points)
+## Interactive viewer (WebGL2, tested with 173M points)
 
 ```
 # one map, one colouring
@@ -64,6 +64,11 @@ python3 tools/pack_viewer.py contigs.fsv --title "co-assembly" \
 python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1:8765/viewer.html?data=contigs.fsv
 ```
 
+Very large sets: `--page-size 25000000` writes `X.json` plus `X.p000.fsv`, `X.p001.fsv`, ... Open
+`viewer.html?data=X.json`: pages load one after another and each is drawn as it arrives, so a browser that runs
+out of memory still shows the pages it could hold (`&pages=N` caps the number). All 173.5M reads (7 pages, 1.7 GB,
+3 colourings) load in about 20 s and draw at about 83 ms per frame on a GV100 in Chrome.
+
 `--layer NAME=FILE:COL` is categorical (empty and `NA` count as unlabelled). `~num` / `~log` bins a numeric column into 64 linear / log steps on a colour ramp.
 
 `viewer.html` is a single file with no dependencies. You can also open it directly and drop a `.fsv` file onto it. It draws every point:
@@ -77,6 +82,15 @@ python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1
 - Save PNG.
 
 ## Sample + project (more points than fit in memory)
+
+All of out_dana_bc (903 barcodes with TNF, 173.5M reads; GV100, 62 GB host RAM): `--sample 0.16` keeps each read
+with probability 0.16 (a hash of its position, so file and date order do not matter), giving a 27.8M reference in
+6 min; projecting all 173.5M reads onto it takes 7 min (8 GB input batches, about 400k reads/s).
+
+```
+./fastsne -i @all_fsb.txt --sample 0.16 --dedup 2 -o ref.tsv --save-model ref.model
+./fastsne --project ref.model -i @all_fsb.txt -o all.tsv
+```
 
 ```
 ./fastsne -i @sample.txt -o ref.tsv --dedup 2 --save-model ref.model      # embed a sample, keep the reference
