@@ -30,6 +30,8 @@
   label.row output { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
   label.pick { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 8px; margin: 4px 0 6px; color: var(--muted); }
   label.pick[hidden] { display: none; }
+  label.check { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; color: var(--muted); }
+  label.check[hidden] { display: none; }
   input[type=range] { width: 100%; accent-color: var(--accent); }
   input[type=search] { width: 100%; background: #0f131b; color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px 8px; font: inherit; }
@@ -71,6 +73,7 @@
       <label class="row">Opacity <input id="alpha" type="range" min="0.02" max="1" step="0.02" value="0.6"><output></output></label>
       <label class="row">Unlabelled <input id="ualpha" type="range" min="0" max="1" step="0.05" value="0.35"><output></output></label>
       <label class="row">Others dim <input id="dim" type="range" min="0" max="0.5" step="0.01" value="0.04"><output></output></label>
+      <label class="check" id="projRow" hidden><input id="proj" type="checkbox" checked> Projected points</label>
       <div class="btns"><button id="reset">Reset view</button><button id="clear">Clear selection</button><button id="png">Save PNG</button></div>
     </div>
     <div class="sec"><input id="q" type="search" placeholder="Search categories (Enter selects matches)"></div>
@@ -159,27 +162,31 @@ function parse(buf) {
 }
 
 // one page of points: its own arrays and GL buffers; the header (maps, bounds, categories) is shared by all pages
-function makePart(p) {
+function makePart(p, kind) {
   return {
-    n: p.n,
+    n: p.n, kind: kind || "",
     embs: p.embs.map(e => ({ x: e.x, y: e.y, xb: glBuffer(e.x), yb: glBuffer(e.y), gidx: null })),
     layers: p.layers.map(l => ({ c: l.c, cb: glBuffer(l.c) })),
   };
 }
-function addPage(buf) {
+// pages of kind "projected" (points placed onto a reference map) can be hidden with the checkbox
+const shown = part => part.kind !== "projected" || $("proj").checked;
+function addPage(buf, kind) {
   const p = parse(buf);
   if (p.embs.length !== D.embs.length || p.layers.length !== D.layers.length) throw new Error("page does not match the first page");
-  const part = makePart(p);
+  const part = makePart(p, kind);
+  if (kind === "projected") $("projRow").hidden = false;
   if (gl.getError() === gl.OUT_OF_MEMORY) throw new Error("GPU out of memory");
   D.parts.push(part); D.n += part.n;
   if (E) setTimeout(() => buildGrid(ei), 30);
   showStat(); dirty = true;
 }
 
-function load(buf) {
+function load(buf, kind) {
   const t0 = performance.now();
   const p = parse(buf);
-  D = { hdr: p.hdr, n: p.n, total: p.hdr.total || p.n, missing: p.missing, embs: p.embs, layers: p.layers, parts: [makePart(p)] };
+  D = { hdr: p.hdr, n: p.n, total: p.hdr.total || p.n, missing: p.missing, embs: p.embs, layers: p.layers, parts: [makePart(p, kind)] };
+  $("projRow").hidden = kind !== "projected";
   for (const e of D.embs) { delete e.x; delete e.y; const [x0, x1, y0, y1] = e.bounds; Object.assign(e, { x0, y0, sx: x1 - x0, sy: y1 - y0 }); }
   for (const l of D.layers) {
     delete l.c;
@@ -213,7 +220,8 @@ function showStat() {
   if (!L) return;
   // category counts in the header cover every page
   const labelled = D.total - L.categories[0].count;
-  const pts = D.n < D.total ? `${D.n.toLocaleString()} of ${D.total.toLocaleString()} points (${D.parts.length} pages)` : `${D.n.toLocaleString()} points`;
+  let vis = 0; for (const part of D.parts) if (shown(part)) vis += part.n;
+  const pts = vis < D.total ? `${vis.toLocaleString()} of ${D.total.toLocaleString()} points shown (${D.parts.length} pages loaded)` : `${vis.toLocaleString()} points`;
   $("stat").textContent = `${pts} · ${(L.categories.length - 1).toLocaleString()} ${L.ordinal ? "bins" : "categories"} · ${(100 * labelled / D.total).toFixed(0)}% ${L.ordinal ? "with a value" : "labelled"}`;
 }
 function setLayer(i) {
@@ -278,6 +286,7 @@ function draw() {
     gl.uniform1i(U.uPass, pass);
     // each chunk re-points the attributes at a byte offset and draws from vertex 0
     for (const part of D.parts) {
+      if (!shown(part)) continue;
       const pe = part.embs[ei], pl = part.layers[li];
       for (let s = 0; s < part.n; s += CHUNK) {
         gl.bindBuffer(gl.ARRAY_BUFFER, pe.xb); gl.vertexAttribPointer(LOC.px, 1, gl.UNSIGNED_SHORT, true, 0, 2 * s);
@@ -331,6 +340,7 @@ for (const id of ["size", "alpha", "ualpha", "dim"]) {
 $("emb").addEventListener("change", ev => setEmbedding(+ev.target.value, false));
 $("layer").addEventListener("change", ev => setLayer(+ev.target.value));
 $("reset").onclick = resetView;
+$("proj").addEventListener("change", () => { showStat(); dirty = true; });
 $("clear").onclick = () => { sel.clear(); updatePalette(); renderList(); };
 $("fold").onclick = () => { const p = $("panel"); p.classList.toggle("collapsed"); $("fold").textContent = p.classList.contains("collapsed") ? "+" : "–"; };
 $("png").onclick = () => { dirty = true; draw(); const a = document.createElement("a"); a.download = "fastsne.png"; a.href = canvas.toDataURL("image/png"); a.click(); };
@@ -409,7 +419,7 @@ function pick(mx, my) {
   let best = -1, bd = 1, bi = -1, scanned = 0, base = 0;
   for (const part of D.parts) {
     const pe = part.embs[ei], pc = part.layers[li].c;
-    if (!pe.gidx) { base += part.n; continue; }
+    if (!pe.gidx || !shown(part)) { base += part.n; continue; }
     for (let cy = cy0; cy <= cy1 && scanned < 2e6; cy++) for (let cx = cx0; cx <= cx1; cx++) {
       const c = cy << GB | cx;
       for (let k = pe.gstart[c]; k < pe.gstart[c + 1]; k++) {
@@ -458,12 +468,14 @@ async function loadPaged(u) {
   const idx = await (await fetch(u)).json();
   const dir = u.slice(0, u.lastIndexOf("/") + 1);
   const np = Math.min(idx.pages.length, +(params.get("pages") || idx.pages.length));
+  // a page is a file name or {file, kind}; list reference pages first so they arrive (and draw) first
+  const pages = idx.pages.map(pg => typeof pg === "string" ? { file: pg } : pg);
   for (let k = 0; k < np; k++) {
     $("busy").textContent = `fetching page ${k + 1} of ${np}…`;
     let buf;
     try {
-      buf = await getBuf(dir + idx.pages[k]);
-      if (k === 0) load(buf); else addPage(buf);
+      buf = await getBuf(dir + pages[k].file);
+      if (k === 0) load(buf, pages[k].kind); else addPage(buf, pages[k].kind);
     } catch (e) {
       if (k === 0) throw e;
       $("busy").textContent = `stopped after ${k} of ${np} pages: ${e.message}`; return;

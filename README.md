@@ -85,7 +85,11 @@ out of memory still shows the pages it could hold (`&pages=N` caps the number). 
 
 All of out_dana_bc (903 barcodes with TNF, 173.5M reads; GV100, 62 GB host RAM): `--sample 0.16` keeps each read
 with probability 0.16 (a hash of its position, so file and date order do not matter), giving a 27.8M reference in
-6 min; projecting all 173.5M reads onto it takes 7 min (8 GB input batches, about 400k reads/s).
+6 min; projecting all 173.5M reads onto it takes 7 min (8 GB input batches, about 400k reads/s). A projected point goes
+to the minimum of its t-SNE attraction to its 16 reference neighbours, not their weighted mean, so points whose
+neighbours fall in two clusters land in one of them instead of on a line between them.
+In the viewer, pages can be marked `"kind": "reference"` / `"projected"` in `X.json`; projected pages get a
+checkbox to hide them.
 
 ```
 ./fastsne -i @all_fsb.txt --sample 0.16 --dedup 2 -o ref.tsv --save-model ref.model

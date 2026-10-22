@@ -975,21 +975,41 @@ __global__ void k_smooth_logm(const int* I, const float* P, int64_t n, int K, co
 // ---------------------------------------------------------------------------------------------
 // Saved model + projection of new points
 // ---------------------------------------------------------------------------------------------
+// A point goes to the minimum of its t-SNE attraction sum_j w_j log(1 + |y - y_j|^2) over its reference
+// neighbours. The weighted mean would put points whose neighbours sit in two separate clusters on the empty line
+// between them; the Cauchy kernel ignores far neighbours, so the point lands in one cluster. Start from the best
+// neighbour position, then fixed-point steps y = sum_j u_j y_j / sum_j u_j, u_j = w_j / (1 + |y - y_j|^2).
 __global__ void k_place(const int* I, const float* W, int64_t n, int K, const float2* Yr, float2* out) {
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float x = 0, y = 0, ws = 0;
-    for (int j = 0; j < K; j++) {
-        float w = W[i * K + j];
-        if (w <= 0) continue;
-        float2 r = Yr[I[i * K + j]];
-        x += w * r.x; y += w * r.y; ws += w;
+    const int* nb = I + i * K; const float* w = W + i * K;
+    float best = INFINITY; float2 y = make_float2(NAN, NAN);
+    for (int a = 0; a < K; a++) {
+        if (!(w[a] > 0)) continue;
+        float2 c = Yr[nb[a]];
+        float obj = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float2 r = Yr[nb[j]]; float dx = c.x - r.x, dy = c.y - r.y;
+            obj += w[j] * log1pf(dx * dx + dy * dy);
+        }
+        if (obj < best) { best = obj; y = c; }
     }
-    out[i] = ws > 0 ? make_float2(x / ws, y / ws) : make_float2(NAN, NAN);
+    if (best == INFINITY) { out[i] = y; return; }
+    for (int it = 0; it < 20; it++) {
+        float sx = 0, sy = 0, su = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float2 r = Yr[nb[j]]; float dx = y.x - r.x, dy = y.y - r.y, u = w[j] / (1.f + dx * dx + dy * dy);
+            sx += u * r.x; sy += u * r.y; su += u;
+        }
+        y = make_float2(sx / su, sy / su);
+    }
+    out[i] = y;
 }
 
 // Streams the inputs in batches: same transform + PCA as the reference, kNN against the reference with the
-// reference's inverted file, then each point goes to the kernel-weighted mean of its neighbours' positions.
+// reference's inverted file, then each point goes to the attraction minimum over its neighbours' positions (k_place).
 static void run_project(const Opts& o) {
     Model m;
     load_model(o.project, m);
