@@ -216,6 +216,44 @@ static void parse_unit(const std::string& path, const Unit& u, int* Dp, std::ato
     }
 }
 
+static bool is_fsb(const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".fsb") == 0; }
+
+// binary input written by tools/duckdb_export.py: "FSB1", int32 D, int64 N, N*D float32, ids joined by '\n'
+static void parse_fsb(const std::string& path, std::atomic<int>* Dset, double sample, uint64_t seed, int unit_id, UnitResult& R) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return; }
+    char mg[4]; int32_t D; int64_t N;
+    if (fread(mg, 1, 4, f) != 4 || memcmp(mg, "FSB1", 4) || fread(&D, 4, 1, f) != 1 || fread(&N, 8, 1, f) != 1) {
+        fprintf(stderr, "%s: not an FSB1 file\n", path.c_str()); fclose(f); return;
+    }
+    int expected = 0;
+    if (!Dset->compare_exchange_strong(expected, D) && expected != D) {
+        fprintf(stderr, "%s has %d columns, expected %d; skipped\n", path.c_str(), D, expected); fclose(f); return;
+    }
+    std::vector<float> X((size_t)N * D);
+    if (fread(X.data(), 4, X.size(), f) != X.size()) { fprintf(stderr, "%s truncated\n", path.c_str()); fclose(f); return; }
+    std::vector<char> ids;
+    char buf[1 << 16]; size_t r;
+    while ((r = fread(buf, 1, sizeof buf, f)) > 0) ids.insert(ids.end(), buf, buf + r);
+    fclose(f);
+    size_t p = 0;
+    for (int64_t i = 0; i < N; i++) {
+        size_t e = p; while (e < ids.size() && ids[e] != '\n') e++;
+        bool keep = true;
+        if (sample < 1.0) {
+            uint64_t hsh = splitmix(seed ^ ((uint64_t)unit_id << 32) ^ (uint64_t)(i + 1));
+            keep = (hsh >> 11) * (1.0 / 9007199254740992.0) < sample;
+        }
+        if (keep) {
+            R.ids.insert(R.ids.end(), ids.begin() + p, ids.begin() + e);
+            R.idlen.push_back((uint32_t)(e - p));
+            R.vals.insert(R.vals.end(), X.begin() + (size_t)i * D, X.begin() + (size_t)(i + 1) * D);
+            R.rows++;
+        }
+        p = e + 1;
+    }
+}
+
 struct Data {
     int64_t N = 0; int D = 0;
     // rows stay in the per-unit parse buffers (no second full copy); cstart[c] = first row of chunk c
@@ -265,6 +303,7 @@ static void read_files(const std::vector<std::string>& files, const Opts& o, Dat
         struct stat st;
         if (stat(files[i].c_str(), &st) != 0) { fprintf(stderr, "cannot stat %s\n", files[i].c_str()); exit(1); }
         int64_t sz = st.st_size; total += sz;
+        if (is_fsb(files[i])) { units.push_back({i, -1, -1}); continue; }  // one unit per binary file
         for (int64_t s = 0; s < sz; s += UNIT) units.push_back({i, s, std::min(sz, s + UNIT)});
     }
     LOG("reading %zu files, %.2f GB, %zu units", files.size(), total / 1e9, units.size());
@@ -278,7 +317,8 @@ static void read_files(const std::vector<std::string>& files, const Opts& o, Dat
         for (;;) {
             size_t u = next++;
             if (u >= units.size()) break;
-            parse_unit(files[units[u].file], units[u], &Dloc[t], &Dset, o.sample, o.seed, (int)u, res[u]);
+            if (units[u].start < 0) parse_fsb(files[units[u].file], &Dset, o.sample, o.seed, (int)u, res[u]);
+            else parse_unit(files[units[u].file], units[u], &Dloc[t], &Dset, o.sample, o.seed, (int)u, res[u]);
         }
     });
     for (auto& t : th) t.join();

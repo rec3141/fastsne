@@ -9,7 +9,19 @@ nvcc -O3 -arch=sm_70 -std=c++14 -o fastsne fastsne.cu -lcufft -lcublas      # sm
 python3 render.py tsne.tsv tsne.png --color labels.tsv --cat                 # quick PNG
 ```
 
-Input rows: `id<TAB>f1<TAB>f2...` (header lines skipped). Output: `id x y` in input order.
+Input: TSV rows `id<TAB>f1<TAB>f2...` (header lines skipped), or `.fsb` binary files from
+`tools/duckdb_export.py` (raw float32, no parsing). Output: `id x y` in input order.
+
+```
+# danaSeq: export TNF + kraken taxon from every dana.duckdb (run in the dana-tools env, which has duckdb + numpy)
+WORKERS=4 python tools/duckdb_export.py /data/scratch/tnf_fsb @duckdb_list.txt
+ls /data/scratch/tnf_fsb/*.fsb > fsb_files.txt
+./fastsne --project ref.model -i @fsb_files.txt -o all.tsv
+
+# colour by genus
+python3 tools/kraken_genus.py @kraken_files.txt > genus.tsv     # or the taxon column of the .meta.tsv files
+python3 render.py all.tsv all.png --color genus.tsv --cat --ntop 30
+```
 
 ## Timings (Quadro GV100, 16 threads)
 
@@ -17,6 +29,9 @@ Input rows: `id<TAB>f1<TAB>f2...` (header lines skipped). Output: `id x y` in in
 |---|---|---|---|---|
 | marine assembly tnf.tsv | 1.55M | 14 s | 3 s | 7 s |
 | nanopore reads (5.6% of out_dana_bc) | 9.36M | 110 s | 22 s | 45 s |
+| nanopore reads (17% of out_dana_bc) | 30.0M | 362 s | 87 s | 152 s |
+
+GPU memory is about 0.9 KB per point (30M peaked at 28 GB of the GV100's 32 GB). Host RAM is about 0.6 KB per point.
 
 Reading 20 GB of text takes about 7 s once it's in the page cache.
 

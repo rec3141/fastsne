@@ -3,7 +3,7 @@
 
 render.py emb.tsv out.png [--color file.tsv [--col NAME]] [--cat] [--px 1600]
 --color: tsv with id in first column; numeric -> viridis-like map of the mean per pixel,
-         --cat -> categorical (top 12 categories by count, rest grey).
+         --cat -> categorical (top --ntop categories by count; other categories light grey, unlabelled dark grey).
 """
 import argparse
 import numpy as np
@@ -18,6 +18,7 @@ ap.add_argument("out")
 ap.add_argument("--color")
 ap.add_argument("--col")
 ap.add_argument("--cat", action="store_true")
+ap.add_argument("--ntop", type=int, default=12, help="categories coloured with --cat (rest: light grey)")
 ap.add_argument("--px", type=int, default=1600)
 ap.add_argument("--title", default="")
 a = ap.parse_args()
@@ -45,17 +46,24 @@ if a.color:
     col = a.col or cdf.columns[1]
     v = e[["id"]].merge(cdf[["id", col]], on="id", how="left")[col]
     if a.cat:
-        top = v.value_counts().index[:12]
-        pal = plt.get_cmap("tab20")(np.arange(12) * 1.0 / 20 * 1.66)[:, :3]
-        pal = np.array(["#f6c344", "#35d0e8", "#3ad29f", "#fb7a6e", "#a88bfa", "#f5923e", "#60a5fa",
-                        "#e879f9", "#a3e635", "#fda4af", "#94a3b8", "#fde68a"])
-        pal = np.array([matplotlib.colors.to_rgb(p) for p in pal])
+        vc = v.value_counts()
+        top = [t for t in vc.index if not str(t).startswith("(")][:a.ntop]
+        base = ["#f6c344", "#35d0e8", "#3ad29f", "#fb7a6e", "#a88bfa", "#f5923e", "#60a5fa",
+                "#e879f9", "#a3e635", "#fda4af", "#5eead4", "#fde68a"]
+        pal = [matplotlib.colors.to_rgb(p) for p in base]
+        k = 0
+        while len(pal) < len(top):  # golden-ratio hues, alternating lightness, for the rest
+            h = (0.11 + k * 0.618034) % 1
+            pal.append(matplotlib.colors.hsv_to_rgb((h, 0.55 + 0.25 * (k % 2), 0.98 - 0.2 * ((k // 2) % 2))))
+            k += 1
+        pal = np.array(pal[:len(top)])
         code = np.full(len(v), -1)
         for k, t in enumerate(top):
             code[(v == t).to_numpy()] = k
         rgb = np.zeros((px * px, 3))
         known = code >= 0
-        rgbp = np.full((len(v), 3), 0.35)
+        rgbp = np.full((len(v), 3), 0.28)                 # unlabelled
+        rgbp[(~known) & v.notna().to_numpy()] = 0.5        # labelled, not in the top list
         rgbp[known] = pal[code[known]]
         for ch in range(3):
             rgb[:, ch] = np.bincount(lin, weights=rgbp[:, ch], minlength=px * px)
@@ -82,7 +90,10 @@ ax.axis("off")
 if a.title:
     ax.text(0.01, 0.99, a.title, color="w", fontsize=14, va="top", transform=ax.transAxes)
 if labels is not None:
+    per_col = 25
+    fs = 11 if len(labels) <= 12 else 9
     for k, t in enumerate(labels):
-        ax.text(0.01, 0.95 - k * 0.022, str(t)[:40], color=pal[k], fontsize=11, transform=ax.transAxes)
+        ax.text(0.01 + (k // per_col) * 0.16, 0.955 - (k % per_col) * 0.019, str(t)[:28], color=pal[k],
+                fontsize=fs, transform=ax.transAxes)
 fig.savefig(a.out, facecolor=bg)
 print("wrote", a.out, len(e), "points")
