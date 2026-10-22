@@ -37,7 +37,7 @@ Reading 20 GB of text takes about 7 s once it's in the page cache.
 
 ## CPU version (`fastsne_cpu.cpp`, OpenMP + FFTW)
 
-Same pipeline and options (no `--project` yet). On Grex:
+Same pipeline, options and model files (a model saved by either build can be projected with either). On Grex:
 
 ```
 module load arch/avx512 gcc/13.2.0 fftw/3.3.10

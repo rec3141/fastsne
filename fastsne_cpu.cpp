@@ -7,7 +7,8 @@
 //   - kNN index: two-level k-means (coarse clusters, then fine clusters inside each) so that assigning
 //     points stays cheap; candidates are stored dimension-major per cluster and scanned in 4-query x
 //     16-candidate register tiles
-//   - repulsion: same single-splat FFT field (FFTW), bilinear splat with atomic adds
+//   - repulsion: same single-splat FFT field (FFTW), bilinear splat (per-thread grids while the field is small)
+//   - --project: brute-force nearest reference cluster, then the same tiled scan over its probe list
 //   - neighbour rows are re-sorted by index after the affinities, which speeds up both the attraction
 //     loop (memory order) and the neighbour-overlap measure used by --dedup (sorted-list intersection)
 
@@ -16,6 +17,15 @@
 #include <fftw3.h>
 
 struct F2 { float x, y; };
+// native-width float vectors for the kNN scan tile (GCC lowers wider generic vectors through the stack);
+// vfu is the same type without the alignment requirement, for direct unaligned loads
+#ifdef __AVX512F__
+constexpr int VW = 16;
+#else
+constexpr int VW = 8;
+#endif
+typedef float vf __attribute__((vector_size(VW * 4)));
+typedef float vfu __attribute__((vector_size(VW * 4), aligned(4)));
 
 // ---------------------------------------------------------------------------------------------
 // Transform + PCA
@@ -36,15 +46,39 @@ static void transform_row(float* x, int D, int mode) {
     }
 }
 
+static void transform_all(Data& d, int mode) {
+#pragma omp parallel for schedule(dynamic)
+    for (size_t c = 0; c < d.chunks.size(); c++) {
+        int64_t rows = d.cstart[c + 1] - d.cstart[c];
+        for (int64_t r = 0; r < rows; r++) transform_row(d.chunks[c].data() + r * d.D, d.D, mode);
+    }
+}
+
+// Y = (X - mu) V for every (transformed) row: N x DP row-major
+static std::vector<float> pca_project(const Data& d, const std::vector<float>& muf, const std::vector<float>& Vp, int DP) {
+    const int D = d.D;
+    // V laid out [k][DP] for a vectorised inner loop
+    std::vector<float> Vk((size_t)D * DP);
+    for (int j = 0; j < DP; j++) for (int k = 0; k < D; k++) Vk[(size_t)k * DP + j] = Vp[(size_t)j * D + k];
+    std::vector<float> Y((size_t)d.N * DP);
+#pragma omp parallel for schedule(dynamic)
+    for (size_t c = 0; c < d.chunks.size(); c++) {
+        int64_t rows = d.cstart[c + 1] - d.cstart[c];
+        std::vector<float> acc(DP);
+        for (int64_t r = 0; r < rows; r++) {
+            const float* x = d.chunks[c].data() + r * D;
+            std::fill(acc.begin(), acc.end(), 0.f);
+            for (int k = 0; k < D; k++) { float v = x[k] - muf[k]; const float* vk = Vk.data() + (size_t)k * DP; for (int j = 0; j < DP; j++) acc[j] += v * vk[j]; }
+            memcpy(Y.data() + (size_t)(d.cstart[c] + r) * DP, acc.data(), DP * 4);
+        }
+    }
+    return Y;
+}
+
 // returns N x DP row-major (cluster order not applied yet); fills mu and Vp (D x DP, column j = component j)
 static std::vector<float> transform_pca_cpu(Data& d, const Opts& o, int DP, int mode, std::vector<float>& muf, std::vector<float>& Vp) {
     const int D = d.D; const int64_t N = d.N; const size_t nch = d.chunks.size();
-    // transform in place
-#pragma omp parallel for schedule(dynamic)
-    for (size_t c = 0; c < nch; c++) {
-        int64_t rows = d.cstart[c + 1] - d.cstart[c];
-        for (int64_t r = 0; r < rows; r++) transform_row(d.chunks[c].data() + r * D, D, mode);
-    }
+    transform_all(d, mode);
     // mean over all rows
     std::vector<double> mu(D, 0);
 #pragma omp parallel
@@ -92,22 +126,7 @@ static std::vector<float> transform_pca_cpu(Data& d, const Opts& o, int DP, int 
     LOG("PCA (%lld sampled rows): %d comps explain %.1f%% of variance", (long long)ns, npc, 100 * cum / tr);
     Vp.assign((size_t)D * DP, 0.f);
     for (int j = 0; j < npc; j++) for (int i = 0; i < D; i++) Vp[(size_t)j * D + i] = (float)V[(size_t)i * D + ord[j]];
-    // project: Y = (X - mu) V, V laid out [k][DP] for a vectorised inner loop
-    std::vector<float> Vk((size_t)D * DP);
-    for (int j = 0; j < DP; j++) for (int k = 0; k < D; k++) Vk[(size_t)k * DP + j] = Vp[(size_t)j * D + k];
-    std::vector<float> Y((size_t)N * DP);
-#pragma omp parallel for schedule(dynamic)
-    for (size_t c = 0; c < nch; c++) {
-        int64_t rows = d.cstart[c + 1] - d.cstart[c];
-        std::vector<float> acc(DP);
-        for (int64_t r = 0; r < rows; r++) {
-            const float* x = d.chunks[c].data() + r * D;
-            std::fill(acc.begin(), acc.end(), 0.f);
-            for (int k = 0; k < D; k++) { float v = x[k] - muf[k]; const float* vk = Vk.data() + (size_t)k * DP; for (int j = 0; j < DP; j++) acc[j] += v * vk[j]; }
-            memcpy(Y.data() + (size_t)(d.cstart[c] + r) * DP, acc.data(), DP * 4);
-        }
-    }
-    return Y;
+    return pca_project(d, muf, Vp, DP);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -172,6 +191,110 @@ static inline void topk_insert(float* bd, int* bi, int K, float dd, int id) {
 
 struct KnnOut { std::vector<int> perm, I, offs; std::vector<float> X, Dd, C; int nc = 0; };
 
+// Inverted file over points already sorted by cluster: per cluster a dimension-major copy padded to a multiple of
+// 16 with far-away points, and per cluster the np nearest clusters (by centroid, itself first) to scan
+struct IVF {
+    int nc = 0, DP = 0, np = 0;
+    std::vector<int> offs, probes;
+    std::vector<int64_t> toff;
+    std::vector<float> Xt;
+};
+
+static void ivf_build(IVF& V, const float* X, const std::vector<int>& offs, const std::vector<float>& Cf, int nc, int DP, int nprobe) {
+    V.nc = nc; V.DP = DP; V.offs = offs;
+    V.toff.assign(nc + 1, 0);
+    for (int k = 0; k < nc; k++) V.toff[k + 1] = V.toff[k] + (int64_t)((offs[k + 1] - offs[k] + 15) / 16 * 16) * DP;
+    V.Xt.assign(V.toff[nc], 0.f);
+#pragma omp parallel for schedule(dynamic, 16)
+    for (int k = 0; k < nc; k++) {
+        int s = offs[k], m = offs[k + 1] - s, mp = (m + 15) / 16 * 16;
+        float* b = V.Xt.data() + V.toff[k];
+        for (int d = 0; d < DP; d++) for (int t = 0; t < mp; t++) b[(size_t)d * mp + t] = t < m ? X[(size_t)(s + t) * DP + d] : 1e15f;
+    }
+    const int np = V.np = std::min(nprobe, nc);
+    V.probes.assign((size_t)nc * np, 0);
+    std::vector<float> Ct = transpose_c(Cf, nc, DP);
+#pragma omp parallel
+    {
+        std::vector<float> acc(nc); std::vector<float> bd(np); std::vector<int> bi(np);
+#pragma omp for schedule(dynamic, 16)
+        for (int c = 0; c < nc; c++) {
+            std::fill(acc.begin(), acc.end(), 0.f);
+            for (int d = 0; d < DP; d++) { float x = Cf[(size_t)c * DP + d]; const float* ct = Ct.data() + (size_t)d * nc; for (int k = 0; k < nc; k++) { float e = x - ct[k]; acc[k] += e * e; } }
+            acc[c] = -1;
+            std::fill(bd.begin(), bd.end(), 1e30f); std::fill(bi.begin(), bi.end(), c);
+            for (int k = 0; k < nc; k++) if (acc[k] < bd[np - 1]) topk_insert(bd.data(), bi.data(), np, acc[k], k);
+            for (int j = 0; j < np; j++) V.probes[(size_t)c * np + j] = bi[j];
+        }
+    }
+}
+
+// K nearest indexed points of each query: rows qoffs[c]..qoffs[c+1] of Q are the queries of cluster c. With
+// `self`, Q is the indexed set itself (qoffs == offs) and a query does not count as its own neighbour.
+// Work items are runs of up to 256 queries of one cluster (so one big cluster still spreads over all threads).
+// Loop order keeps candidates in cache: for each probed cluster, for each chunk of 1024 candidates (128 KB at 32
+// dims), every 4-query tile of the run scans it in 4-query x 16-candidate register tiles.
+static void ivf_scan(const IVF& V, const float* Q, const std::vector<int64_t>& qoffs, int K, bool self, int* I, float* Dd) {
+    constexpr int QB = 4, CB = 16, QRUN = 256, TC = 1024;
+    const int DP = V.DP, np = V.np;
+    std::vector<std::pair<int, int64_t>> items;
+    for (int c = 0; c < V.nc; c++) for (int64_t q = qoffs[c]; q < qoffs[c + 1]; q += QRUN) items.push_back({c, q});
+#pragma omp parallel
+    {
+        std::vector<float> qv((size_t)QRUN * DP);
+        std::vector<float> bd((size_t)QRUN * K); std::vector<int> bi((size_t)QRUN * K);
+#pragma omp for schedule(dynamic, 1)
+        for (size_t it = 0; it < items.size(); it++) {
+            const int c = items[it].first;
+            const int64_t s = items[it].second;
+            const int m = (int)std::min<int64_t>(QRUN, qoffs[c + 1] - s), mt = (m + QB - 1) / QB * QB;
+            for (int a = 0; a < mt; a++) memcpy(&qv[(size_t)a * DP], Q + (size_t)(s + std::min(a, m - 1)) * DP, DP * 4);   // pad with the last query
+            std::fill(bd.begin(), bd.begin() + (size_t)m * K, 1e30f); std::fill(bi.begin(), bi.begin() + (size_t)m * K, -1);
+            for (int j = 0; j < np; j++) {
+                int p = V.probes[(size_t)c * np + j];
+                int ps = V.offs[p], pm = V.offs[p + 1] - ps, pmp = (pm + 15) / 16 * 16;
+                const float* blk = V.Xt.data() + V.toff[p];
+                for (int tc = 0; tc < pmp; tc += TC) {
+                    const int te = std::min(pmp, tc + TC);
+                    for (int q0 = 0; q0 < mt; q0 += QB) {
+                        const int nq = std::min(QB, m - q0);
+                        const float* qt = &qv[(size_t)q0 * DP];
+                        for (int t0 = tc; t0 < te; t0 += CB) {
+                            // explicit native-width vectors with direct unaligned loads: the auto-vectorised loop
+                            // ran at ~1 candidate-dim per cycle (stack round trips), this at ~6
+                            constexpr int NV = CB / VW;
+                            vf sa[QB][NV] = {};
+                            for (int d = 0; d < DP; d++) {
+                                vf col[NV];
+                                for (int v = 0; v < NV; v++) col[v] = *(const vfu*)(blk + (size_t)d * pmp + t0 + v * VW);
+                                for (int a = 0; a < QB; a++) { float qd = qt[(size_t)a * DP + d]; for (int v = 0; v < NV; v++) { vf e = qd - col[v]; sa[a][v] += e * e; } }
+                            }
+                            float acc[QB][CB];
+                            memcpy(acc, sa, sizeof acc);
+                            for (int a = 0; a < nq; a++) {
+                                float* bda = &bd[(size_t)(q0 + a) * K]; int* bia = &bi[(size_t)(q0 + a) * K];
+                                int64_t me = self ? s + q0 + a : -1;
+                                for (int t = 0; t < CB; t++) {
+                                    float dd = acc[a][t];
+                                    if (dd < bda[K - 1] && ps + t0 + t != me && t0 + t < pm) topk_insert(bda, bia, K, dd, ps + t0 + t);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (int a = 0; a < m; a++) {
+                int64_t q = s + a;
+                for (int j = 0; j < K; j++) {
+                    int b = bi[(size_t)a * K + j]; float dv = bd[(size_t)a * K + j];
+                    if (b < 0) { b = self ? (int)q : 0; dv = 1e30f; }
+                    I[q * K + j] = b; Dd[q * K + j] = dv;
+                }
+            }
+        }
+    }
+}
+
 static void knn_cpu(std::vector<float>& Y, int64_t N, int DP, const Opts& o, int K, KnnOut& R) {
     const int S = o.cluster_size;                 // target fine cluster size
     int nthreads = omp_get_max_threads();
@@ -231,90 +354,14 @@ static void knn_cpu(std::vector<float>& Y, int64_t N, int DP, const Opts& o, int
     for (int64_t i = 0; i < N; i++) memcpy(&R.X[(size_t)i * DP], &Y[(size_t)R.perm[i] * DP], DP * 4);
     std::vector<float>().swap(Y);
     int maxsz = 0; for (int k = 0; k < nc; k++) maxsz = std::max(maxsz, offs[k + 1] - offs[k]);
-    // 4. dimension-major copy of each cluster, padded to a multiple of 16 with far-away points
-    std::vector<int64_t> toff(nc + 1, 0);
-    for (int k = 0; k < nc; k++) toff[k + 1] = toff[k] + (int64_t)((offs[k + 1] - offs[k] + 15) / 16 * 16) * DP;
-    std::vector<float> Xt(toff[nc]);
-#pragma omp parallel for schedule(dynamic, 16)
-    for (int k = 0; k < nc; k++) {
-        int s = offs[k], m = offs[k + 1] - s, mp = (m + 15) / 16 * 16;
-        float* b = Xt.data() + toff[k];
-        for (int d = 0; d < DP; d++) for (int t = 0; t < mp; t++) b[(size_t)d * mp + t] = t < m ? R.X[(size_t)(s + t) * DP + d] : 1e15f;
-    }
-    // 5. probe lists: nearest fine centroids of each fine centroid (including itself)
-    int np = std::min(o.nprobe, nc);
-    std::vector<int> probes((size_t)nc * np);
-    {
-        std::vector<float> Ct = transpose_c(Cf, nc, DP);
-#pragma omp parallel
-        {
-            std::vector<float> acc(nc); std::vector<float> bd(np); std::vector<int> bi(np);
-#pragma omp for schedule(dynamic, 16)
-            for (int c = 0; c < nc; c++) {
-                std::fill(acc.begin(), acc.end(), 0.f);
-                for (int d = 0; d < DP; d++) { float x = Cf[(size_t)c * DP + d]; const float* ct = Ct.data() + (size_t)d * nc; for (int k = 0; k < nc; k++) { float e = x - ct[k]; acc[k] += e * e; } }
-                acc[c] = -1;
-                std::fill(bd.begin(), bd.end(), 1e30f); std::fill(bi.begin(), bi.end(), c);
-                for (int k = 0; k < nc; k++) if (acc[k] < bd[np - 1]) topk_insert(bd.data(), bi.data(), np, acc[k], k);
-                for (int j = 0; j < np; j++) probes[(size_t)c * np + j] = bi[j];
-            }
-        }
-    }
+    IVF V;
+    ivf_build(V, R.X.data(), offs, Cf, nc, DP, o.nprobe);
     double work = 0;
-    for (int c = 0; c < nc; c++) { double cand = 0; for (int j = 0; j < np; j++) { int p = probes[(size_t)c * np + j]; cand += offs[p + 1] - offs[p]; } work += cand * (offs[c + 1] - offs[c]); }
-    LOG("kNN: %d fine clusters (max size %d), %d probes, %.0f candidates/query", nc, maxsz, np, work / N);
-    // 6. scan: 4 queries x 16 candidates per register tile
+    for (int c = 0; c < nc; c++) { double cand = 0; for (int j = 0; j < V.np; j++) { int p = V.probes[(size_t)c * V.np + j]; cand += offs[p + 1] - offs[p]; } work += cand * (offs[c + 1] - offs[c]); }
+    LOG("kNN: %d fine clusters (max size %d), %d probes, %.0f candidates/query", nc, maxsz, V.np, work / N);
     R.I.assign((size_t)N * K, 0); R.Dd.assign((size_t)N * K, 1e30f);
-    constexpr int QB = 4, CB = 16;
-#pragma omp parallel
-    {
-        std::vector<float> qv((size_t)QB * DP);
-        std::vector<float> bd((size_t)QB * K); std::vector<int> bi((size_t)QB * K);
-#pragma omp for schedule(dynamic, 1)
-        for (int c = 0; c < nc; c++) {
-            int s = offs[c], m = offs[c + 1] - s;
-            for (int q0 = 0; q0 < m; q0 += QB) {
-                int nq = std::min(QB, m - q0);
-                for (int a = 0; a < QB; a++) {
-                    int qa = std::min(q0 + a, m - 1);   // duplicate the last query to fill the tile
-                    memcpy(&qv[(size_t)a * DP], &R.X[(size_t)(s + qa) * DP], DP * 4);
-                }
-                std::fill(bd.begin(), bd.end(), 1e30f); std::fill(bi.begin(), bi.end(), -1);
-                for (int j = 0; j < np; j++) {
-                    int p = probes[(size_t)c * np + j];
-                    int ps = offs[p], pm = offs[p + 1] - ps, pmp = (pm + 15) / 16 * 16;
-                    const float* blk = Xt.data() + toff[p];
-                    for (int t0 = 0; t0 < pmp; t0 += CB) {
-                        float acc[QB][CB];
-                        for (int a = 0; a < QB; a++) for (int t = 0; t < CB; t++) acc[a][t] = 0.f;
-                        for (int d = 0; d < DP; d++) {
-                            const float* col = blk + (size_t)d * pmp + t0;
-                            for (int a = 0; a < QB; a++) {
-                                float qd = qv[(size_t)a * DP + d];
-                                for (int t = 0; t < CB; t++) { float e = qd - col[t]; acc[a][t] += e * e; }
-                            }
-                        }
-                        for (int a = 0; a < nq; a++) {
-                            float* bda = &bd[(size_t)a * K]; int* bia = &bi[(size_t)a * K];
-                            int self = s + q0 + a;
-                            for (int t = 0; t < CB; t++) {
-                                float dd = acc[a][t];
-                                if (dd < bda[K - 1] && ps + t0 + t != self && t0 + t < pm) topk_insert(bda, bia, K, dd, ps + t0 + t);
-                            }
-                        }
-                    }
-                }
-                for (int a = 0; a < nq; a++) {
-                    int64_t q = s + q0 + a;
-                    for (int j = 0; j < K; j++) {
-                        int b = bi[(size_t)a * K + j]; float dv = bd[(size_t)a * K + j];
-                        if (b < 0) { b = (int)q; dv = 1e30f; }
-                        R.I[q * K + j] = b; R.Dd[q * K + j] = dv;
-                    }
-                }
-            }
-        }
-    }
+    std::vector<int64_t> qoffs(offs.begin(), offs.end());
+    ivf_scan(V, R.X.data(), qoffs, K, true, R.I.data(), R.Dd.data());
     LOG("kNN scan done");
     // optional NN-descent rounds (in place)
     for (int r = 0; r < o.refine; r++) {
@@ -613,17 +660,131 @@ static void run_tsne_cpu(std::vector<F2>& Y, int64_t N, int K, const std::vector
     F.release();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Saved model + projection of new points
+// ---------------------------------------------------------------------------------------------
+// Same placement as the GPU's k_place: the minimum of the t-SNE attraction sum_j w_j log(1 + |y - y_j|^2) over the
+// reference neighbours (the weighted mean would put points whose neighbours sit in two clusters between them).
+// Start from the best neighbour position, then fixed-point steps y = sum_j u_j y_j / sum_j u_j, u_j = w_j / (1 + d_j^2).
+static F2 place_point(const int* nb, const float* w, int K, const float* Yr) {
+    float best = INFINITY; F2 y = {NAN, NAN};
+    for (int a = 0; a < K; a++) {
+        if (!(w[a] > 0)) continue;
+        float cx = Yr[2 * (size_t)nb[a]], cy = Yr[2 * (size_t)nb[a] + 1], obj = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float dx = cx - Yr[2 * (size_t)nb[j]], dy = cy - Yr[2 * (size_t)nb[j] + 1];
+            obj += w[j] * log1pf(dx * dx + dy * dy);
+        }
+        if (obj < best) { best = obj; y = {cx, cy}; }
+    }
+    if (best == INFINITY) return y;
+    for (int it = 0; it < 20; it++) {
+        float sx = 0, sy = 0, su = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float rx = Yr[2 * (size_t)nb[j]], ry = Yr[2 * (size_t)nb[j] + 1], dx = y.x - rx, dy = y.y - ry, u = w[j] / (1.f + dx * dx + dy * dy);
+            sx += u * rx; sy += u * ry; su += u;
+        }
+        y = {sx / su, sy / su};
+    }
+    return y;
+}
+
+// Streams the inputs in batches: same transform + PCA as the reference, nearest reference cluster, kNN against the
+// reference's inverted file, then each point goes to the attraction minimum over its neighbours' positions.
+// Reads models written by either build.
+static void run_project_cpu(const Opts& o) {
+    Model m;
+    load_model(o.project, m);
+    LOG("model: %lld reference points, %d -> %d dims, %d clusters", (long long)m.N, m.D, m.DP, m.nc);
+    const int K = o.proj_k, DP = m.DP, nc = m.nc;
+    IVF V;
+    ivf_build(V, m.X.data(), m.offs, m.C, nc, DP, o.nprobe);
+    std::vector<float>().swap(m.X);
+    // the centroids as a one-cluster index, for exact nearest-centroid search with the same tiled scan
+    IVF Vc;
+    { std::vector<int> o1 = {0, nc}; std::vector<float> c0(DP, 0.f); ivf_build(Vc, m.C.data(), o1, c0, 1, DP, 1); }
+    LOG("reference index built (%d probes)", V.np);
+
+    std::vector<std::string> files = expand_inputs(o);
+    std::vector<std::vector<std::string>> batches(1);
+    double acc = 0;
+    for (auto& fn : files) {
+        struct stat st; if (stat(fn.c_str(), &st) != 0) { fprintf(stderr, "cannot stat %s\n", fn.c_str()); exit(1); }
+        if (acc > 0 && acc + st.st_size > o.batch_gb * 1e9) { batches.emplace_back(); acc = 0; }
+        batches.back().push_back(fn); acc += st.st_size;
+    }
+    FILE* f = fopen(o.out.c_str(), "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
+    std::vector<char> buf(1 << 20);
+    setvbuf(f, buf.data(), _IOFBF, buf.size());
+    fputs("id\tx\ty\tnn_dist\n", f);
+    int64_t total = 0;
+    double t0 = now();
+    for (size_t b = 0; b < batches.size(); b++) {
+        Data d;
+        read_files(batches[b], o, d);
+        if (d.D != m.D) { fprintf(stderr, "input has %d columns, model expects %d\n", d.D, m.D); exit(1); }
+        const int64_t n = d.N;
+        transform_all(d, m.mode);
+        std::vector<float> Q = pca_project(d, m.mu, m.Vp, DP);
+        std::vector<std::vector<float>>().swap(d.chunks);
+        double tb = now();
+        // group queries by nearest reference cluster: exact, as a K = 1 tiled scan over all centroids at once
+        std::vector<int> a(n);
+        {
+            std::vector<float> dmin(n);
+            std::vector<int64_t> all = {0, n};
+            ivf_scan(Vc, Q.data(), all, 1, false, a.data(), dmin.data());
+        }
+        double tc = now();
+        std::vector<int64_t> qoffs(nc + 1, 0);
+        for (int64_t i = 0; i < n; i++) qoffs[a[i] + 1]++;
+        for (int c = 0; c < nc; c++) qoffs[c + 1] += qoffs[c];
+        std::vector<int64_t> pm(n);
+        { std::vector<int64_t> cur(qoffs.begin(), qoffs.end() - 1); for (int64_t i = 0; i < n; i++) pm[cur[a[i]]++] = i; }
+        std::vector<int>().swap(a);
+        std::vector<float> Qs((size_t)n * DP);
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < n; i++) memcpy(&Qs[(size_t)i * DP], &Q[(size_t)pm[i] * DP], DP * 4);
+        std::vector<float>().swap(Q);
+        std::vector<int> I((size_t)n * K); std::vector<float> Dd((size_t)n * K);
+        ivf_scan(V, Qs.data(), qoffs, K, false, I.data(), Dd.data());
+        std::vector<float>().swap(Qs);
+        double td = now();
+        std::vector<F2> Yo(n); std::vector<float> nno(n);
+#pragma omp parallel for schedule(dynamic, 4096)
+        for (int64_t i = 0; i < n; i++) {
+            float* dd = &Dd[i * K];
+            float nn = sqrtf(dd[0]);
+            perplexity_row(dd, K, logf(o.proj_perp), false, 1.f);
+            Yo[pm[i]] = place_point(&I[i * K], dd, K, m.Y.data());
+            nno[pm[i]] = nn;
+        }
+        for (int64_t i = 0; i < n; i++) {
+            fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], f);
+            fprintf(f, "\t%.4f\t%.4f\t%.4g\n", Yo[i].x, Yo[i].y, nno[i]);
+        }
+        total += n;
+        LOG("batch %zu/%zu: %lld points (%lld total, %.0f points/s; nearest cluster %.1fs, kNN %.1fs, place + write %.1fs)",
+            b + 1, batches.size(), (long long)n, (long long)total, total / (now() - t0), tc - tb, td - tc, now() - td);
+    }
+    fclose(f);
+    LOG("wrote %s", o.out.c_str());
+}
+
 int main(int argc, char** argv) {
     Opts o;
     parse_args(argc, argv, o);
-    if (!o.project.empty()) { fprintf(stderr, "fastsne_cpu: --project is GPU-only for now; use fastsne\n"); return 1; }
     if (o.threads > 0) omp_set_num_threads(o.threads);
     if (o.nprobe < 0) o.nprobe = 32;
     if (o.refine < 0) o.refine = 1;
     if (o.cluster_size < 0) o.cluster_size = 1000;
+    LOG("fastsne_cpu: %d threads", omp_get_max_threads());
+    if (!o.project.empty()) { run_project_cpu(o); return 0; }
     fftwf_init_threads();
     fftwf_plan_with_nthreads(omp_get_max_threads());
-    LOG("fastsne_cpu: %d threads", omp_get_max_threads());
 
     Data d;
     read_files(expand_inputs(o), o, d);
