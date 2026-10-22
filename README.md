@@ -20,7 +20,7 @@ ls /data/scratch/tnf_fsb/*.fsb > fsb_files.txt
 
 # colour by genus
 python3 tools/kraken_genus.py @kraken_files.txt > genus.tsv     # or the taxon column of the .meta.tsv files
-python3 render.py all.tsv all.png --color genus.tsv --cat --ntop 30
+python3 render.py all.tsv all.png --color genus.tsv --cat --ntop 30      # --ntop 0 --no-legend: every genus
 ```
 
 ## Timings (Quadro GV100, 16 threads)
@@ -34,6 +34,24 @@ python3 render.py all.tsv all.png --color genus.tsv --cat --ntop 30
 GPU memory is about 0.9 KB per point (30M peaked at 28 GB of the GV100's 32 GB). Host RAM is about 0.6 KB per point.
 
 Reading 20 GB of text takes about 7 s once it's in the page cache.
+
+## Interactive viewer (WebGL2, tested with 30M points)
+
+```
+python3 tools/pack_viewer.py tsne.tsv tsne.fsv --color genus.tsv --title "my reads"   # 6 bytes/point
+python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1:8765/viewer.html?data=tsne.fsv
+```
+
+`viewer.html` is a single file with no dependencies. You can also open it directly and drop a `.fsv` file onto it. It draws every point:
+- 30M points take about 47 ms per frame on a GV100, and the 180 MB file loads in a few seconds.
+- Scroll to zoom, drag to pan.
+- Hover shows the category under the cursor.
+- Click a point or a list entry to highlight that category; shift-click adds more.
+- Search box: Enter selects all matching categories.
+- Sliders for point size, opacity, unlabelled opacity and how far non-selected points are dimmed.
+- Save PNG.
+
+Labelled points are drawn in random order above the unlabelled ones, so each pixel shows roughly its majority category.
 
 ## Sample + project (more points than fit in memory)
 

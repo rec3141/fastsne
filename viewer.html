@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fastsne viewer</title>
+<style>
+  :root {
+    --bg: #0d1017; --panel: #151a23; --line: #262d3a; --text: #e6e9ef; --muted: #8b93a3; --accent: #35d0e8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #panel { position: fixed; top: 12px; right: 12px; bottom: 12px; width: 300px; max-width: calc(100vw - 24px);
+    background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--line); border-radius: 10px;
+    display: flex; flex-direction: column; overflow: hidden; backdrop-filter: blur(6px); }
+  #panel.collapsed { bottom: auto; }
+  #panel.collapsed .body { display: none; }
+  .head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .head h1 { font-size: 14px; margin: 0; flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button, .filebtn { background: #1e2531; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 9px; font: inherit; cursor: pointer; }
+  button:hover, .filebtn:hover { border-color: var(--accent); }
+  .body { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .sec { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .stat { color: var(--muted); }
+  label.row { display: grid; grid-template-columns: 92px 1fr 34px; align-items: center; gap: 8px; margin: 4px 0; color: var(--muted); }
+  label.row output { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=search] { width: 100%; background: #0f131b; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 8px; font: inherit; }
+  .btns { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  #cats { overflow-y: auto; flex: 1; padding: 4px 0; }
+  .cat { display: grid; grid-template-columns: 12px 1fr auto; gap: 8px; align-items: center; padding: 3px 12px; cursor: pointer; }
+  .cat:hover { background: #1c2230; }
+  .cat.sel { background: #1f2a3a; }
+  .cat .sw { width: 12px; height: 12px; border-radius: 3px; }
+  .cat .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cat .ct { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #tip { position: fixed; pointer-events: none; background: #0b0e14ee; border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 8px; display: none; white-space: nowrap; z-index: 5; }
+  #drop { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+    color: var(--muted); padding: 16px; }
+  #drop.over { outline: 2px dashed var(--accent); outline-offset: -16px; }
+  #drop b { color: var(--text); }
+  #busy { position: fixed; left: 12px; bottom: 12px; color: var(--muted); }
+  @media (max-width: 640px) { #panel { width: auto; left: 12px; top: auto; height: 45vh; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="drop"><div><b>fastsne viewer</b><br>Drop a <code>.fsv</code> file here or use <b>Open</b>.<br>
+  Make one with <code>tools/pack_viewer.py emb.tsv out.fsv --color cats.tsv</code>,<br>
+  or serve this folder and open <code>viewer.html?data=out.fsv</code>.</div></div>
+<div id="panel">
+  <div class="head">
+    <h1 id="title">fastsne viewer</h1>
+    <label class="filebtn">Open<input id="file" type="file" accept=".fsv" hidden></label>
+    <button id="fold" title="Collapse panel">–</button>
+  </div>
+  <div class="body">
+    <div class="sec">
+      <div class="stat" id="stat">No data loaded</div>
+      <label class="row">Point size <input id="size" type="range" min="0.5" max="10" step="0.5" value="1.5"><output></output></label>
+      <label class="row">Opacity <input id="alpha" type="range" min="0.02" max="1" step="0.02" value="0.6"><output></output></label>
+      <label class="row">Unlabelled <input id="ualpha" type="range" min="0" max="1" step="0.05" value="0.35"><output></output></label>
+      <label class="row">Others dim <input id="dim" type="range" min="0" max="0.5" step="0.01" value="0.04"><output></output></label>
+      <div class="btns"><button id="reset">Reset view</button><button id="clear">Clear selection</button><button id="png">Save PNG</button></div>
+    </div>
+    <div class="sec"><input id="q" type="search" placeholder="Search categories (Enter selects matches)"></div>
+    <div id="cats"></div>
+  </div>
+</div>
+<div id="tip"></div>
+<div id="busy"></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const canvas = $("c");
+const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: true });
+if (!gl) { $("drop").innerHTML = "<div>This viewer needs WebGL2.</div>"; throw new Error("no webgl2"); }
+
+const VS = `#version 300 es
+in float px; in float py; in uint cat;
+uniform vec2 uA, uB; uniform float uSize, uAlpha;
+uniform sampler2D uPal;
+out vec4 vCol;
+void main() {
+  vec4 c = texelFetch(uPal, ivec2(int(cat % 4096u), int(cat / 4096u)), 0);
+  float a = c.a * uAlpha;
+  if (a <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 0.0; return; }
+  vCol = vec4(c.rgb * a, a);
+  gl_Position = vec4(vec2(px, py) * uA + uB, 0.0, 1.0);
+  gl_PointSize = uSize;
+}`;
+const FS = `#version 300 es
+precision mediump float;
+in vec4 vCol; uniform bool uRound; out vec4 o;
+void main() {
+  if (uRound) { vec2 d = gl_PointCoord - 0.5; if (dot(d, d) > 0.25) discard; }
+  o = vCol;
+}`;
+function shader(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+const U = {}; for (const u of ["uA", "uB", "uSize", "uAlpha", "uPal", "uRound"]) U[u] = gl.getUniformLocation(prog, u);
+const vao = gl.createVertexArray();
+
+let D = null;            // loaded data
+const view = { cx: 0, cy: 0, ppu: 1 };
+const sel = new Set();
+let dirty = true;
+
+function hexToRgb(h) { const v = parseInt(h.slice(1), 16); return [v >> 16 & 255, v >> 8 & 255, v & 255]; }
+
+function parse(buf) {
+  const dv = new DataView(buf);
+  if (String.fromCharCode(...new Uint8Array(buf, 0, 4)) !== "FSV1") throw new Error("not an FSV1 file");
+  const hl = dv.getUint32(4, true);
+  const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl)));
+  const n = hdr.n, off = 8 + hl;
+  return { hdr, n, x: new Uint16Array(buf, off, n), y: new Uint16Array(buf, off + 2 * n, n), c: new Uint16Array(buf, off + 4 * n, n) };
+}
+
+function load(buf) {
+  const t0 = performance.now();
+  D = parse(buf);
+  const { hdr, n } = D;
+  D.cats = hdr.categories;
+  D.rgb = D.cats.map(c => hexToRgb(c.color));
+  D.grey = D.cats.map((c, i) => i === 0 || c.name.startsWith("("));
+  const [x0, x1, y0, y1] = hdr.bounds;
+  D.sx = x1 - x0; D.sy = y1 - y0; D.x0 = x0; D.y0 = y0;
+  gl.bindVertexArray(vao);
+  const attr = (name, arr, int) => {
+    const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, name); gl.enableVertexAttribArray(loc);
+    if (int) gl.vertexAttribIPointer(loc, 1, gl.UNSIGNED_SHORT, 0, 0);
+    else gl.vertexAttribPointer(loc, 1, gl.UNSIGNED_SHORT, true, 0, 0);
+  };
+  attr("px", D.x); attr("py", D.y); attr("cat", D.c, true);
+  D.palW = 4096; D.palH = Math.ceil(D.cats.length / 4096);
+  D.pal = new Uint8Array(D.palW * D.palH * 4);
+  D.tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, D.tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.uniform1i(U.uPal, 0);
+  sel.clear();
+  updatePalette();
+  $("title").textContent = hdr.title || "fastsne viewer";
+  document.title = hdr.title || "fastsne viewer";
+  const labelled = n - D.cats[0].count;
+  $("stat").textContent = `${n.toLocaleString()} points · ${(D.cats.length - 1).toLocaleString()} categories · ${(100 * labelled / n).toFixed(0)}% labelled`;
+  $("drop").style.display = "none";
+  resetView();
+  renderList();
+  $("busy").textContent = `loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s · indexing for hover…`;
+  setTimeout(buildGrid, 30);
+}
+
+function updatePalette() {
+  if (!D) return;
+  const ua = +$("ualpha").value, dim = +$("dim").value, any = sel.size > 0;
+  for (let i = 0; i < D.cats.length; i++) {
+    let [r, g, b] = D.rgb[i], a = 1;
+    if (D.grey[i]) a = ua;
+    if (any && !sel.has(i)) { a = Math.min(a, dim); r = g = b = 150; }
+    D.pal.set([r, g, b, Math.round(a * 255)], 4 * i);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, D.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, D.palW, D.palH, 0, gl.RGBA, gl.UNSIGNED_BYTE, D.pal);
+  dirty = true;
+}
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; dirty = true; }
+}
+
+function resetView() {
+  if (!D) return;
+  resize();
+  view.cx = D.x0 + D.sx / 2; view.cy = D.y0 + D.sy / 2;
+  view.ppu = 0.95 * Math.min(canvas.clientWidth / D.sx, canvas.clientHeight / D.sy);
+  dirty = true;
+}
+
+function draw() {
+  resize();
+  if (!dirty) return;
+  dirty = false;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0.051, 0.063, 0.09, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!D) return;
+  const W = canvas.clientWidth, H = canvas.clientHeight, k = 2 * view.ppu;
+  gl.uniform2f(U.uA, D.sx * k / W, D.sy * k / H);
+  gl.uniform2f(U.uB, (D.x0 - view.cx) * k / W, (D.y0 - view.cy) * k / H);
+  const dpr = window.devicePixelRatio || 1, size = +$("size").value * dpr;
+  gl.uniform1f(U.uSize, size);
+  gl.uniform1f(U.uAlpha, +$("alpha").value);
+  gl.uniform1i(U.uRound, size >= 3 ? 1 : 0);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.bindVertexArray(vao);
+  gl.drawArrays(gl.POINTS, 0, D.n);
+}
+(function loop() { draw(); requestAnimationFrame(loop); })();
+
+// ---------------- interaction ----------------
+const toData = (mx, my) => [view.cx + (mx - canvas.clientWidth / 2) / view.ppu, view.cy - (my - canvas.clientHeight / 2) / view.ppu];
+canvas.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const [dx, dy] = toData(ev.offsetX, ev.offsetY);
+  const f = Math.exp(-ev.deltaY * (ev.deltaMode ? 0.05 : 0.0015));
+  view.ppu *= f;
+  view.cx = dx - (dx - view.cx) / f; view.cy = dy - (dy - view.cy) / f;
+  dirty = true;
+}, { passive: false });
+let drag = null;
+canvas.addEventListener("pointerdown", ev => { drag = { x: ev.clientX, y: ev.clientY, moved: false }; canvas.setPointerCapture(ev.pointerId); });
+canvas.addEventListener("pointermove", ev => {
+  if (drag) {
+    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true;
+    view.cx -= dx / view.ppu; view.cy += dy / view.ppu; drag.x = ev.clientX; drag.y = ev.clientY; dirty = true;
+    $("tip").style.display = "none";
+  } else hover(ev);
+});
+canvas.addEventListener("pointerup", ev => {
+  if (drag && !drag.moved) { const c = pick(ev.offsetX, ev.offsetY); if (c > 0 && !D.grey[c]) toggle(c, ev.shiftKey || ev.ctrlKey || ev.metaKey); }
+  drag = null;
+});
+canvas.addEventListener("pointerleave", () => { $("tip").style.display = "none"; });
+window.addEventListener("resize", () => { dirty = true; });
+for (const id of ["size", "alpha", "ualpha", "dim"]) {
+  const el = $(id), out = el.nextElementSibling;
+  const upd = () => { out.textContent = el.value; if (id === "ualpha" || id === "dim") updatePalette(); dirty = true; };
+  el.addEventListener("input", upd); upd();
+}
+$("reset").onclick = resetView;
+$("clear").onclick = () => { sel.clear(); updatePalette(); renderList(); };
+$("fold").onclick = () => { const p = $("panel"); p.classList.toggle("collapsed"); $("fold").textContent = p.classList.contains("collapsed") ? "+" : "–"; };
+$("png").onclick = () => { dirty = true; draw(); const a = document.createElement("a"); a.download = "fastsne.png"; a.href = canvas.toDataURL("image/png"); a.click(); };
+
+function toggle(i, add) {
+  if (!add) { const only = sel.size === 1 && sel.has(i); sel.clear(); if (!only) sel.add(i); }
+  else if (sel.has(i)) sel.delete(i); else sel.add(i);
+  updatePalette(); renderList();
+}
+
+// ---------------- category list ----------------
+function renderList() {
+  const box = $("cats"); box.textContent = "";
+  if (!D) return;
+  const q = $("q").value.trim().toLowerCase();
+  const items = [];
+  for (let i = 0; i < D.cats.length; i++) {
+    if (q && !D.cats[i].name.toLowerCase().includes(q)) continue;
+    items.push(i);
+  }
+  items.sort((a, b) => (sel.has(b) - sel.has(a)) || D.cats[b].count - D.cats[a].count);
+  const frag = document.createDocumentFragment();
+  for (const i of items.slice(0, 400)) {
+    const c = D.cats[i], row = document.createElement("div");
+    row.className = "cat" + (sel.has(i) ? " sel" : "");
+    row.innerHTML = `<span class="sw" style="background:${c.color}"></span><span class="nm"></span><span class="ct">${c.count.toLocaleString()}</span>`;
+    row.querySelector(".nm").textContent = c.name;
+    row.title = c.name;
+    if (!D.grey[i]) row.onclick = ev => toggle(i, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+    else row.style.cursor = "default";
+    frag.appendChild(row);
+  }
+  if (items.length > 400) {
+    const more = document.createElement("div"); more.className = "cat stat"; more.textContent = `… ${items.length - 400} more (refine the search)`;
+    frag.appendChild(more);
+  }
+  box.appendChild(frag);
+}
+$("q").addEventListener("input", renderList);
+$("q").addEventListener("keydown", ev => {
+  if (ev.key !== "Enter" || !D) return;
+  const q = $("q").value.trim().toLowerCase(); if (!q) return;
+  sel.clear();
+  D.cats.forEach((c, i) => { if (!D.grey[i] && c.name.toLowerCase().includes(q)) sel.add(i); });
+  updatePalette(); renderList();
+});
+
+// ---------------- hover picking: uniform grid over the quantised coordinates ----------------
+const GB = 10, G = 1 << GB, SH = 16 - GB;
+function buildGrid() {
+  const t0 = performance.now(), { n, x, y } = D;
+  const start = new Uint32Array(G * G + 1);
+  for (let i = 0; i < n; i++) start[((y[i] >> SH) << GB | (x[i] >> SH)) + 1]++;
+  for (let i = 0; i < G * G; i++) start[i + 1] += start[i];
+  const fill = start.slice(0, G * G), idx = new Uint32Array(n);
+  for (let i = 0; i < n; i++) idx[fill[(y[i] >> SH) << GB | (x[i] >> SH)]++] = i;
+  D.gstart = start; D.gidx = idx;
+  $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds)`;
+}
+function pick(mx, my) {
+  if (!D || !D.gidx) return -1;
+  const [dx, dy] = toData(mx, my);
+  const qx = (dx - D.x0) / D.sx * 65535, qy = (dy - D.y0) / D.sy * 65535;
+  const r = Math.max(4, +$("size").value * 1.5) / view.ppu;     // pick radius in data units
+  const rqx = r / D.sx * 65535, rqy = r / D.sy * 65535;
+  const cx0 = Math.max(0, (qx - rqx) >> SH), cx1 = Math.min(G - 1, (qx + rqx) >> SH);
+  const cy0 = Math.max(0, (qy - rqy) >> SH), cy1 = Math.min(G - 1, (qy + rqy) >> SH);
+  let best = -1, bd = 1, bi = -1, scanned = 0;
+  for (let cy = cy0; cy <= cy1 && scanned < 2e6; cy++) for (let cx = cx0; cx <= cx1; cx++) {
+    const c = cy << GB | cx;
+    for (let k = D.gstart[c]; k < D.gstart[c + 1]; k++) {
+      const i = D.gidx[k]; scanned++;
+      const cat = D.c[i];
+      if (D.pal[4 * cat + 3] < 8) continue;                     // hidden
+      const ex = (D.x[i] - qx) / rqx, ey = (D.y[i] - qy) / rqy, d = ex * ex + ey * ey;
+      // prefer coloured points, then later-drawn (on top), then nearer
+      if (d < 1 && (best < 0 || D.grey[best] && !D.grey[cat] || (D.grey[best] === D.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {
+        best = cat; bd = d; bi = i;
+      }
+    }
+  }
+  return best;
+}
+let hoverT = 0;
+function hover(ev) {
+  const now = performance.now(); if (now - hoverT < 40) return; hoverT = now;
+  const c = pick(ev.offsetX, ev.offsetY), tip = $("tip");
+  if (c < 0) { tip.style.display = "none"; return; }
+  tip.innerHTML = `<span class="sw" style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${D.cats[c].color}"></span> `;
+  tip.append(D.cats[c].name, ` · ${D.cats[c].count.toLocaleString()} reads`);
+  tip.style.display = "block";
+  const x = Math.min(ev.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+  tip.style.left = x + "px"; tip.style.top = (ev.clientY + 14) + "px";
+}
+
+// ---------------- loading ----------------
+function readFile(f) {
+  $("busy").textContent = `reading ${f.name} (${(f.size / 1e6).toFixed(0)} MB)…`;
+  f.arrayBuffer().then(load).catch(e => { $("busy").textContent = "error: " + e.message; });
+}
+$("file").addEventListener("change", ev => { if (ev.target.files[0]) readFile(ev.target.files[0]); });
+const drop = $("drop");
+window.addEventListener("dragover", ev => { ev.preventDefault(); drop.classList.add("over"); });
+window.addEventListener("dragleave", () => drop.classList.remove("over"));
+window.addEventListener("drop", ev => { ev.preventDefault(); drop.classList.remove("over"); if (ev.dataTransfer.files[0]) readFile(ev.dataTransfer.files[0]); });
+const url = new URLSearchParams(location.search).get("data");
+if (url) {
+  $("busy").textContent = `fetching ${url}…`;
+  fetch(url).then(r => { if (!r.ok) throw new Error(r.status + " " + r.statusText); return r.arrayBuffer(); })
+    .then(load).catch(e => { $("busy").textContent = "error: " + e.message; });
+}
+</script>
+</body>
+</html>

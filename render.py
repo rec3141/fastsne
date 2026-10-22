@@ -18,7 +18,8 @@ ap.add_argument("out")
 ap.add_argument("--color")
 ap.add_argument("--col")
 ap.add_argument("--cat", action="store_true")
-ap.add_argument("--ntop", type=int, default=12, help="categories coloured with --cat (rest: light grey)")
+ap.add_argument("--ntop", type=int, default=12, help="categories coloured with --cat, 0 = all (rest: light grey)")
+ap.add_argument("--no-legend", action="store_true")
 ap.add_argument("--px", type=int, default=1600)
 ap.add_argument("--title", default="")
 a = ap.parse_args()
@@ -47,27 +48,27 @@ if a.color:
     v = e[["id"]].merge(cdf[["id", col]], on="id", how="left")[col]
     if a.cat:
         vc = v.value_counts()
-        top = [t for t in vc.index if not str(t).startswith("(")][:a.ntop]
-        base = ["#f6c344", "#35d0e8", "#3ad29f", "#fb7a6e", "#a88bfa", "#f5923e", "#60a5fa",
-                "#e879f9", "#a3e635", "#fda4af", "#5eead4", "#fde68a"]
-        pal = [matplotlib.colors.to_rgb(p) for p in base]
-        k = 0
-        while len(pal) < len(top):  # golden-ratio hues, alternating lightness, for the rest
-            h = (0.11 + k * 0.618034) % 1
-            pal.append(matplotlib.colors.hsv_to_rgb((h, 0.55 + 0.25 * (k % 2), 0.98 - 0.2 * ((k // 2) % 2))))
-            k += 1
-        pal = np.array(pal[:len(top)])
-        code = np.full(len(v), -1)
-        for k, t in enumerate(top):
-            code[(v == t).to_numpy()] = k
-        rgb = np.zeros((px * px, 3))
+        top = [t for t in vc.index if not str(t).startswith("(")]
+        if a.ntop > 0:
+            top = top[:a.ntop]
+        # vivid palette: golden-ratio hues (neighbours in rank order get far-apart hues), near-full saturation,
+        # brightness stepping through 3 levels so similar hues still differ
+        k = np.arange(len(top))
+        hsv = np.c_[(0.08 + k * 0.618034) % 1, 1.0 - 0.12 * (k % 2), 1.0 - 0.14 * ((k // 2) % 3)]
+        pal = matplotlib.colors.hsv_to_rgb(hsv).reshape(-1, 3)
+        rank = {t: i for i, t in enumerate(top)}
+        code = v.map(rank).fillna(-1).to_numpy().astype(int)
+        # a pixel takes the mean colour of its coloured points; only pixels without any coloured point fall
+        # back to grey (light: labelled outside the top list, dark: unlabelled), so labels are not washed out
         known = code >= 0
-        rgbp = np.full((len(v), 3), 0.28)                 # unlabelled
-        rgbp[(~known) & v.notna().to_numpy()] = 0.5        # labelled, not in the top list
-        rgbp[known] = pal[code[known]]
+        rgb = np.zeros((px * px, 3))
+        nk = np.bincount(lin[known], minlength=px * px)
         for ch in range(3):
-            rgb[:, ch] = np.bincount(lin, weights=rgbp[:, ch], minlength=px * px)
-        rgb /= np.maximum(cnt, 1)[:, None]
+            rgb[:, ch] = np.bincount(lin[known], weights=pal[code[known], ch], minlength=px * px)
+        rgb /= np.maximum(nk, 1)[:, None]
+        other = v.notna().to_numpy() & ~known
+        no = np.bincount(lin[other], minlength=px * px)
+        rgb[nk == 0] = np.where((no[nk == 0] > 0)[:, None], 0.5, 0.28)
         labels = list(top)
     else:
         vv = v.to_numpy(dtype=float)
@@ -89,7 +90,7 @@ ax.imshow(img, interpolation="nearest")
 ax.axis("off")
 if a.title:
     ax.text(0.01, 0.99, a.title, color="w", fontsize=14, va="top", transform=ax.transAxes)
-if labels is not None:
+if labels is not None and not a.no_legend:
     per_col = 25
     fs = 11 if len(labels) <= 12 else 9
     for k, t in enumerate(labels):
