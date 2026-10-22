@@ -247,7 +247,11 @@ canvas.addEventListener("pointermove", ev => {
   } else hover(ev);
 });
 canvas.addEventListener("pointerup", ev => {
-  if (drag && !drag.moved) { const c = pick(ev.offsetX, ev.offsetY); if (c > 0 && !D.grey[c]) toggle(c, ev.shiftKey || ev.ctrlKey || ev.metaKey); }
+  if (drag && !drag.moved && D) {
+    const c = pick(ev.offsetX, ev.offsetY);
+    if (c > 0 && !D.grey[c]) toggle(c, ev.shiftKey || ev.ctrlKey || ev.metaKey);
+    else if (sel.size && !(ev.shiftKey || ev.ctrlKey || ev.metaKey)) { sel.clear(); updatePalette(); renderList(); }  // empty space clears
+  }
   drag = null;
 });
 canvas.addEventListener("pointerleave", () => { $("tip").style.display = "none"; });
@@ -258,6 +262,9 @@ for (const id of ["size", "alpha", "ualpha", "dim"]) {
   el.addEventListener("input", upd); upd();
 }
 $("reset").onclick = resetView;
+window.addEventListener("keydown", ev => {
+  if (ev.key === "Escape" && sel.size && document.activeElement !== $("q")) { sel.clear(); updatePalette(); renderList(); }
+});
 $("clear").onclick = () => { sel.clear(); updatePalette(); renderList(); };
 $("fold").onclick = () => { const p = $("panel"); p.classList.toggle("collapsed"); $("fold").textContent = p.classList.contains("collapsed") ? "+" : "–"; };
 $("png").onclick = () => { dirty = true; draw(); const a = document.createElement("a"); a.download = "fastsne.png"; a.href = canvas.toDataURL("image/png"); a.click(); };
@@ -315,7 +322,7 @@ function buildGrid() {
   const fill = start.slice(0, G * G), idx = new Uint32Array(n);
   for (let i = 0; i < n; i++) idx[fill[(y[i] >> SH) << GB | (x[i] >> SH)]++] = i;
   D.gstart = start; D.gidx = idx;
-  $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds)`;
+  $("busy").textContent = `hover index built in ${((performance.now() - t0) / 1000).toFixed(1)} s · scroll to zoom, drag to pan, click a point or a name to highlight (shift adds; Esc or empty space clears)`;
 }
 function pick(mx, my) {
   if (!D || !D.gidx) return -1;
@@ -331,7 +338,7 @@ function pick(mx, my) {
     for (let k = D.gstart[c]; k < D.gstart[c + 1]; k++) {
       const i = D.gidx[k]; scanned++;
       const cat = D.c[i];
-      if (D.pal[4 * cat + 3] < 8) continue;                     // hidden
+      if (D.grey[cat] && D.pal[4 * cat + 3] < 8) continue;      // hidden unlabelled; dimmed genera stay pickable
       const ex = (D.x[i] - qx) / rqx, ey = (D.y[i] - qy) / rqy, d = ex * ex + ey * ey;
       // prefer coloured points, then later-drawn (on top), then nearer
       if (d < 1 && (best < 0 || D.grey[best] && !D.grey[cat] || (D.grey[best] === D.grey[cat] && (d < bd || i > bi && d < bd * 1.5)))) {

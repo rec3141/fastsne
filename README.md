@@ -46,7 +46,7 @@ python3 -m http.server 8765 --bind 127.0.0.1        # then open http://127.0.0.1
 - 30M points take about 47 ms per frame on a GV100, and the 180 MB file loads in a few seconds.
 - Scroll to zoom, drag to pan.
 - Hover shows the category under the cursor.
-- Click a point or a list entry to highlight that category; shift-click adds more.
+- Click a point or a list entry to highlight that category (dimmed categories stay clickable); shift-click adds more. Esc or a click on empty space clears the selection.
 - Search box: Enter selects all matching categories.
 - Sliders for point size, opacity, unlabelled opacity and how far non-selected points are dimmed.
 - Save PNG.
