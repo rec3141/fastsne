@@ -52,6 +52,14 @@ make native                 # or `make cpu` for a portable build
 | genoa, 192 cores (CPU) | 57 s | 103 s, 14.6 GB RAM |
 | lgpu, L40S 48 GB | 19 s | 60 s, 8.2 GB GPU |
 
+All 173.5M out_dana_bc reads on one genoa node (192 cores): full embedding in 14 min 47 s (160 GB RAM; layout 533 s,
+mostly attraction), or a 27.8M random-sample reference in 4 min 12 s (66 GB; 97 s of it reading all 101 GB to
+sample) plus projection of all reads in 5 min 29 s (530k reads/s, 22 GB).
+
+fastsne_cpu sets `OMP_WAIT_POLICY=passive` unless it is already set: spinning OpenMP threads collapse when other
+jobs share the CPU (a run that takes 21 s idle took over 120 s spinning with 4 of 16 hardware threads busy, 34 s
+passive).
+
 kNN recall@48 on the contigs (1000 queries): 0.89 on both CPU and GPU (32 probes + 1 refinement round, the
 default for both). On the CPU, 16 probes give 0.80 and 8 probes without refinement 0.64.
 
