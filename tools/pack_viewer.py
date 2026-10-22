@@ -125,7 +125,7 @@ for spec in a.layer:
         x = pd.to_numeric(v, errors="coerce").to_numpy(np.float64)
         ok = np.isfinite(x) & ((x > 0) if mode == "log" else True)
         xs = np.log10(x[ok]) if mode == "log" else x[ok]
-        lo, hi = np.percentile(xs, [0.5, 99.5])
+        lo, hi = np.percentile(xs, [0.5, 99.5]) if ok.any() else (0.0, 1.0)   # no usable values: all "missing"
         nb = 64
         b = np.clip(((xs - lo) / max(hi - lo, 1e-12) * nb).astype(int), 0, nb - 1)
         code = np.zeros(n, np.int64)
