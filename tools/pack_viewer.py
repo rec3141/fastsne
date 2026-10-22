@@ -24,12 +24,11 @@ uint16 y[n] (quantised over its bounding box), then per layer uint16 cat[n] (0 =
 shuffled once, so the viewer can draw grey points first and coloured points in random order on top.
 """
 import argparse
+import colorsys
 import json
 import struct
 import sys
 
-import matplotlib
-import matplotlib.colors
 import numpy as np
 import pandas as pd
 
@@ -68,7 +67,19 @@ def table(path):
 
 def vivid(k):
     h, s, v = (0.08 + k * 0.618034) % 1, 1.0 - 0.12 * (k % 2), 1.0 - 0.14 * ((k // 2) % 3)
-    return matplotlib.colors.to_hex(matplotlib.colors.hsv_to_rgb((h, s, v)))
+    return to_hex(colorsys.hsv_to_rgb(h, s, v))
+
+
+def to_hex(rgb):
+    return "#" + "".join(f"{int(round(min(max(c, 0.0), 1.0) * 255)):02x}" for c in rgb)
+
+
+def turbo(x):
+    """Google's polynomial approximation of the turbo colour map (no matplotlib needed)"""
+    r = 0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943))))
+    g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604))))
+    b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771 + x * (-89.90310912 + x * 27.34824973))))
+    return r, g, b
 
 
 # embeddings
@@ -121,14 +132,13 @@ for spec in a.layer:
         code[ok] = b + 1
         edges = lo + (hi - lo) * np.arange(nb + 1) / nb
         fmt = (lambda e: f"{10 ** e:,.3g}") if mode == "log" else (lambda e: f"{e:,.3g}")
-        cmap = matplotlib.colormaps["turbo"]
         counts = np.bincount(code, minlength=nb + 1)
         cats = [{"name": "missing", "count": int(counts[0]), "color": "#474747"}]
         for i in range(nb):
             nm = f"{fmt(edges[i])} – {fmt(edges[i + 1])}"
             if i == 0: nm = "≤ " + fmt(edges[1])
             if i == nb - 1: nm = "≥ " + fmt(edges[i])
-            cats.append({"name": nm, "count": int(counts[i + 1]), "color": matplotlib.colors.to_hex(cmap(0.05 + 0.9 * i / (nb - 1)))})
+            cats.append({"name": nm, "count": int(counts[i + 1]), "color": to_hex(turbo(0.05 + 0.9 * i / (nb - 1)))})
         layers.append({"name": name, "ordinal": True, "categories": cats, "code": code})
     else:
         v = v.astype("string").str.strip()
