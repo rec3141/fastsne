@@ -1,0 +1,115 @@
+name: Release binaries
+
+# Self-contained Linux x86-64 binaries (make STATIC=1), attached to the GitHub release
+# of each v* tag. A manual run builds and smoke-tests them and keeps the tarball as a
+# workflow artifact, without releasing.
+#
+#   fastsne_cpu (+ .avx512 / .avx2 / .generic): fully static, FFTW and OpenMP included;
+#                runs on any x86-64 Linux
+#   fastsne:     cuFFT / cuBLAS / CUDA runtime linked in, needs only the NVIDIA driver
+#                (CUDA 12: driver 525 or newer); built on Rocky Linux 8, so glibc 2.28 or newer
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CUDA_IMAGE: nvidia/cuda:12.6.3-devel-rockylinux8
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libfftw3-dev > /dev/null
+          make -s cpu STATIC=1
+          for f in fastsne_cpu.avx512 fastsne_cpu.avx2 fastsne_cpu.generic; do
+            file $f | grep -q "statically linked" || { file $f; exit 1; }
+          done
+      # every build the runner's CPU can execute, on a small random table
+      - name: Smoke test
+        run: |
+          python3 -c "
+          import random; random.seed(1)
+          with open('t.tsv','w') as f:
+              for i in range(20000):
+                  c = i % 5
+                  f.write(f'r{i}\t' + '\t'.join(f'{c + random.random():.4f}' for _ in range(16)) + '\n')"
+          flags=$(grep -m1 '^flags' /proc/cpuinfo)
+          for v in generic avx2 avx512; do
+            case $v in
+              avx2)   echo "$flags" | grep -qw avx2 || continue ;;
+              avx512) echo "$flags" | grep -qw avx512bw || continue ;;
+            esac
+            rm -f o.tsv
+            ./fastsne_cpu.$v -i t.tsv -o o.tsv --threads 2 > log 2>&1 || { cat log; exit 1; }
+            [ "$(wc -l < o.tsv)" -eq 20000 ] || { echo "$v: wrong row count"; exit 1; }
+            echo "$v ok"
+          done
+          FASTSNE_VERBOSE=1 ./fastsne_cpu -i t.tsv -o o.tsv --threads 2 2>&1 | head -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cpu
+          path: fastsne_cpu*
+
+  gpu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # in a container: the build container is several GB, and glibc 2.28 sets the oldest host it runs on
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$CUDA_IMAGE" bash -c '
+            dnf install -y -q --enablerepo=powertools make libstdc++-static > /dev/null
+            make -s gpu STATIC=1 NVCC=/usr/local/cuda/bin/nvcc'
+          ldd fastsne
+          if ldd fastsne | grep -qE "libcu|not found"; then exit 1; fi
+          ./fastsne --help 2>&1 | head -1 | grep -q "^fastsne -i"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu
+          path: fastsne
+
+  package:
+    needs: [cpu, gpu]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Package
+        id: pkg
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || ver="dev-${GITHUB_SHA::7}"
+          name="fastsne-${ver}-linux-x86_64"
+          chmod +x fastsne fastsne_cpu*
+          make -s install PREFIX="$PWD/$name"
+          install -m 644 README.md "$name/share/fastsne/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          ls -la "$name/bin"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.tar.gz*
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="${{ steps.pkg.outputs.name }}"
+          notes="Self-contained Linux x86-64 binaries: fastsne (GPU; needs only the NVIDIA driver, 525 or newer; glibc 2.28+) and fastsne_cpu (fully static; AVX-512 / AVX2 / generic, picked at run time). Install: tar -xzf $name.tar.gz --strip-components=1 -C /usr/local"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" --title "$GITHUB_REF_NAME" --notes "$notes"
+          fi

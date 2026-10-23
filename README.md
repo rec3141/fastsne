@@ -2,6 +2,19 @@
 
 GPU t-SNE for very large TNF tables (nanopore reads, contigs). Single CUDA binary: needs only the CUDA toolkit (cuFFT, cuBLAS, thrust).
 
+Prebuilt Linux x86-64 binaries are attached to each [release](https://github.com/rec3141/fastsne/releases):
+`fastsne` (GPU; cuFFT / cuBLAS linked in, so it needs only the NVIDIA driver, 525 or newer, and glibc 2.28+) and
+`fastsne_cpu` (fully static; AVX-512 / AVX2 / generic builds, picked at run time).
+
+```
+v=v0.2.1; f=fastsne-$v-linux-x86_64.tar.gz
+curl -fsSLO https://github.com/rec3141/fastsne/releases/download/$v/$f
+curl -fsSL https://github.com/rec3141/fastsne/releases/download/$v/$f.sha256 | sha256sum -c
+tar -xzf $f --strip-components=1 -C /usr/local      # bin/, share/fastsne/ (viewer, tools)
+```
+
+To build from source (`STATIC=1` gives the self-contained release builds):
+
 ```
 make gpu                    # fastsne (CUDA): V100, A30/A100, L40S + PTX; CUDA_ARCHS="70 80 89" to change
 make cpu                    # fastsne_cpu (OpenMP + FFTW): AVX-512 / AVX2 / generic builds behind a launcher
@@ -145,3 +158,8 @@ Very high coverage genomes (e.g. a Planktothrix bloom) give kNN neighbourhoods m
 These reads are detectable because they share most of their neighbours with their neighbours: about 0.5 vs a median of 0.2. Global exaggeration does *not* fix the worms (they tangle into a hairball). `--dedup A` gives such reads a lower repulsion mass instead, which acts as local exaggeration, so the group collapses into a compact blob. Groups are touched only where neighbour sharing is above the median by more than `--dedup-margin`. Reasonable values for A are 1–4, with 2 a good default.
 
 Other knobs: `--shrink G` (shrink large label-propagation groups, works for contigs, not for noisy reads), `--mass-file`, `--exag`, `--iters`, `--k`, `--pca`, `--sample F` (subsample rows on read), `--check-knn N`, `--check-grad N`, `--diag FILE`, `--groups FILE`.
+
+## License
+
+GPL-3.0 (see `LICENSE`). The release builds link FFTW (GPL) and NVIDIA's cuFFT / cuBLAS / CUDA runtime, which
+NVIDIA permits redistributing in applications.
