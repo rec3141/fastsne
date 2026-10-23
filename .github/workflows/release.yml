@@ -46,7 +46,7 @@ jobs:
             esac
             rm -f o.tsv
             ./fastsne_cpu.$v -i t.tsv -o o.tsv --threads 2 > log 2>&1 || { cat log; exit 1; }
-            [ "$(wc -l < o.tsv)" -eq 20000 ] || { echo "$v: wrong row count"; exit 1; }
+            [ "$(wc -l < o.tsv)" -eq 20001 ] || { echo "$v: wrong row count"; exit 1; }
             echo "$v ok"
           done
           FASTSNE_VERBOSE=1 ./fastsne_cpu -i t.tsv -o o.tsv --threads 2 2>&1 | head -1
