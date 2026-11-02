@@ -31,6 +31,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import union_categoricals
 
 ap = argparse.ArgumentParser()
 ap.add_argument("pos", nargs="*")
@@ -55,14 +56,52 @@ if not a.emb:
     sys.exit("need at least one --emb")
 
 _tables = {}
+NA_LIKE = ["", "NA", "nan", "None", "unclassified"]
+
+# Everything from one file (e.g. a map of 100M+ reads): rows are taken as they are, without the id index
+# (whose strings alone would not fit in memory), loading only the columns used, text columns as categories.
+_paths = {s.split("=", 1)[1].partition(":")[0] for s in a.emb} | \
+         {s.split("=", 1)[1].rpartition(":")[0] for s in a.layer} | ({a.kind.rpartition(":")[0]} if a.kind else set())
+single = len(_paths) == 1 and all(s.rpartition(":")[2].partition("~")[0] for s in a.layer)
+if single:
+    _cols, _cat = set(), set()
+    for spec in a.emb:
+        cols = spec.split("=", 1)[1].partition(":")[2]
+        _cols.update(cols.split(",") if cols else ("x", "y"))
+    for spec in a.layer:
+        col = spec.split("=", 1)[1].rpartition(":")[2]
+        name, _, mode = col.partition("~")
+        _cols.add(name)
+        if not mode:
+            _cat.add(name)
+    if a.kind:
+        _cols.add(a.kind.rpartition(":")[2]); _cat.add(a.kind.rpartition(":")[2])
 
 
 def table(path):
     if path not in _tables:
-        t = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
-        t = t.rename(columns={t.columns[0]: "id"}).drop_duplicates("id").set_index("id")
+        if single:
+            # in chunks: each chunk's text columns become categories (empty = "", so every chunk's categories are
+            # strings), joined with union_categoricals; read_csv's own category dtype fails on mixed chunks
+            parts = []
+            for c in pd.read_csv(path, sep="\t", usecols=lambda c: c in _cols, dtype={c: str for c in _cat},
+                                 chunksize=5_000_000):
+                for k in _cat:
+                    c[k] = c[k].fillna("").astype("category")
+                parts.append(c)
+            t = pd.DataFrame({k: union_categoricals([c[k] for c in parts]) if k in _cat else
+                              np.concatenate([c[k].to_numpy() for c in parts]) for k in parts[0].columns})
+            del parts
+        else:
+            t = pd.read_csv(path, sep="\t", dtype={0: str}, low_memory=False)
+            t = t.rename(columns={t.columns[0]: "id"}).drop_duplicates("id").set_index("id")
         _tables[path] = t
     return _tables[path]
+
+
+def rows(t, ids):
+    """t's rows for ids (positions in single-file mode)"""
+    return t.iloc[ids] if single else t.reindex(ids)
 
 
 def vivid(k):
@@ -91,18 +130,18 @@ for spec in a.emb:
     xc, yc = cols.split(",") if cols else ("x", "y")
     t = table(path)
     if ids is None:
-        ids = t.index
+        ids = np.arange(len(t)) if single else t.index
         rng = np.random.default_rng(1)
         ids = ids[rng.permutation(len(ids))]
         nref = None
         if a.kind:
             # reference rows first, each group keeps its shuffled order
             kpath, _, kcol = a.kind.rpartition(":")
-            isref = (table(kpath).reindex(ids)[kcol].astype("string") == "reference").to_numpy(dtype=bool, na_value=False)
+            isref = (rows(table(kpath), ids)[kcol] == "reference").to_numpy(dtype=bool, na_value=False)
             ids = ids[np.r_[np.flatnonzero(isref), np.flatnonzero(~isref)]]
             nref = int(isref.sum())
             a.page_size = a.page_size or 25_000_000
-    xy = t.reindex(ids)[[xc, yc]].to_numpy(np.float64)
+    xy = rows(t, ids)[[xc, yc]].to_numpy(np.float64)
     ok = np.isfinite(xy).all(1)
     lo, hi = xy[ok].min(0), xy[ok].max(0)
     q = np.round((xy - lo) / np.maximum(hi - lo, 1e-12) * 65534).clip(0, 65534)
@@ -120,7 +159,7 @@ for spec in a.layer:
         col, mode = col.split("~")
     t = table(path)
     col = col or t.columns[0]
-    v = t.reindex(ids)[col]
+    v = rows(t, ids)[col]
     if mode in ("num", "log"):
         x = pd.to_numeric(v, errors="coerce").to_numpy(np.float64)
         ok = np.isfinite(x) & ((x > 0) if mode == "log" else True)
@@ -141,10 +180,20 @@ for spec in a.layer:
             cats.append({"name": nm, "count": int(counts[i + 1]), "color": to_hex(turbo(0.05 + 0.9 * i / (nb - 1)))})
         layers.append({"name": name, "ordinal": True, "categories": cats, "code": code})
     else:
-        v = v.astype("string").str.strip()
-        v = v.mask(v.isin(["", "NA", "nan", "None", "unclassified"]))
-        vc = v.value_counts()
-        code = v.map({t: i + 1 for i, t in enumerate(vc.index)}).fillna(0).to_numpy().astype(np.int64)
+        # via categories, so 100M+ rows never become 100M+ strings
+        v = v.astype("category")
+        lab = pd.Series(v.cat.categories.astype(str)).str.strip()
+        lab = lab.mask(lab.isin(NA_LIKE))
+        uniq = pd.Index(lab.dropna().unique())
+        cat2u = uniq.get_indexer(lab)                       # category -> cleaned label (-1: unlabelled)
+        c = v.cat.codes.to_numpy()
+        u = np.where(c >= 0, cat2u[c], -1)
+        cnt = np.bincount(u[u >= 0], minlength=len(uniq))
+        order = np.argsort(-cnt, kind="stable")
+        vc = pd.Series(cnt[order], index=uniq[order])
+        rank = np.empty(len(uniq), np.int64); rank[order] = np.arange(1, len(uniq) + 1)
+        code = np.where(u >= 0, rank[np.maximum(u, 0)], 0).astype(np.int64)
+        del u, c
         cats = [{"name": "unlabelled", "count": int((code == 0).sum()), "color": "#474747"}]
         k = 0
         for t_, c_ in zip(vc.index, vc.values):

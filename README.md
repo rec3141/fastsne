@@ -133,7 +133,7 @@ checkbox to hide them.
 ./fastsne --project ref.model -i @all_files.txt -o all.tsv               # stream everything else onto it
 ```
 
-Projection streams the inputs in batches (`--batch-gb`, 8 GB of text). Each point gets the same transform + PCA as the reference. It is then matched to its 16 nearest reference points through the reference's inverted file, and placed at their kernel-weighted mean position (perplexity 5). The output adds `nn_dist`, the distance to the nearest reference point, for QC.
+Projection streams the inputs in batches (`--batch-gb`, 8 GB of text). Each point gets the same transform + PCA as the reference. It is then matched to its 16 nearest reference points through the reference's inverted file, and placed at the minimum of its t-SNE attraction to them (start at the best neighbour, then 20 fixed-point steps). The output adds `nn_dist`, the distance to the nearest reference point, for QC.
 
 On the marine assembly (reference = 50% sample), all 1.55M contigs projected in 3 s. The median GC difference between a contig and its 10 nearest map neighbours was:
 - 0.92 for held-out contigs,
@@ -153,7 +153,7 @@ The model file is about 136 B per reference point (32-d PCA + 2-d position), i.e
 
 ## Worms (`--dedup`)
 
-Very high coverage genomes (e.g. a Planktothrix bloom) give kNN neighbourhoods made of overlapping reads. The kNN graph is then a 1-D chain along the genome, and t-SNE draws it as worms and rings.
+Very high coverage genomes (e.g. *Aquiluna* in a 2.1M-read subset of out_dana_bc) give kNN neighbourhoods made of overlapping reads. The kNN graph is then a 1-D chain along the genome, and t-SNE draws it as worms and rings.
 
 These reads are detectable because they share most of their neighbours with their neighbours: about 0.5 vs a median of 0.2. Global exaggeration does *not* fix the worms (they tangle into a hairball). `--dedup A` gives such reads a lower repulsion mass instead, which acts as local exaggeration, so the group collapses into a compact blob. Groups are touched only where neighbour sharing is above the median by more than `--dedup-margin`. Reasonable values for A are 1–4, with 2 a good default.
 
