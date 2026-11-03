@@ -118,7 +118,7 @@ static std::vector<float> transform_pca_cpu(Data& d, const Opts& o, int DP, int 
     for (int a = 0; a < D; a++) for (int b = a; b < D; b++) { C[(size_t)a * D + b] /= ns; C[(size_t)b * D + a] = C[(size_t)a * D + b]; }
     double tr = 0; for (int j = 0; j < D; j++) tr += C[(size_t)j * D + j];
     std::vector<double> V, ev;
-    jacobi_eigen(C, D, V, ev);
+    sym_eigen(C, D, std::min(o.pca, D), V, ev);
     std::vector<int> ord(D); std::iota(ord.begin(), ord.end(), 0);
     std::sort(ord.begin(), ord.end(), [&](int a, int b) { return ev[a] > ev[b]; });
     int npc = std::min(o.pca, D);
@@ -784,6 +784,7 @@ int main(int argc, char** argv) {
     }
     Opts o;
     parse_args(argc, argv, o);
+    if (o.sphere != 0) { fprintf(stderr, "--sphere needs the GPU build (fastsne)\n"); return 1; }
     if (o.threads > 0) omp_set_num_threads(o.threads);
     if (o.nprobe < 0) o.nprobe = 32;
     if (o.refine < 0) o.refine = 1;

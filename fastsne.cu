@@ -132,7 +132,7 @@ static float* transform_pca(Data& d, const Opts& o, int DP, cublasHandle_t blas,
     for (auto& c : C) c /= N;
     double tr = 0; for (int j = 0; j < D; j++) tr += C[(size_t)j * D + j];
     std::vector<double> V, ev;
-    jacobi_eigen(C, D, V, ev);
+    sym_eigen(C, D, std::min(o.pca, D), V, ev);
     std::vector<int> ord(D); std::iota(ord.begin(), ord.end(), 0);
     std::sort(ord.begin(), ord.end(), [&](int a, int b) { return ev[a] > ev[b]; });
     int npc = std::min(o.pca, D);
@@ -163,7 +163,8 @@ static float* transform_pca(Data& d, const Opts& o, int DP, cublasHandle_t blas,
 // ---------------------------------------------------------------------------------------------
 template <int DP>
 __global__ void k_assign(const float* __restrict__ X, int64_t n, const float* __restrict__ C, int nc, int* assign) {
-    __shared__ float4 sc[128 * (DP / 4)];
+    constexpr int CT = DP > 64 ? 64 : 128;  // centroids per shared-memory tile (48 KB static limit)
+    __shared__ float4 sc[CT * (DP / 4)];
     int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
     float q[DP];
     if (i < n) {
@@ -171,8 +172,8 @@ __global__ void k_assign(const float* __restrict__ X, int64_t n, const float* __
         for (int j = 0; j < DP; j++) q[j] = X[i * DP + j];
     }
     float best = 1e30f; int bi = 0;
-    for (int c0 = 0; c0 < nc; c0 += 128) {
-        int cn = min(128, nc - c0);
+    for (int c0 = 0; c0 < nc; c0 += CT) {
+        int cn = min(CT, nc - c0);
         __syncthreads();
         for (int t = threadIdx.x; t < cn * (DP / 4); t += blockDim.x)
             sc[t] = reinterpret_cast<const float4*>(C + (int64_t)c0 * DP)[t];
@@ -368,6 +369,8 @@ static void refine_dispatch(int DP, int K, const float* X, int64_t n, int A, con
         case 32: launch_refine_k<32>(K, X, n, A, I0, D0, I1, D1); break;
         case 48: launch_refine_k<48>(K, X, n, A, I0, D0, I1, D1); break;
         case 64: launch_refine_k<64>(K, X, n, A, I0, D0, I1, D1); break;
+        case 96: launch_refine_k<96>(K, X, n, A, I0, D0, I1, D1); break;
+        case 128: launch_refine_k<128>(K, X, n, A, I0, D0, I1, D1); break;
         default: fprintf(stderr, "unsupported pca dims %d\n", DP); exit(1);
     }
 }
@@ -398,6 +401,8 @@ static void assign_dispatch(int DP, const float* X, int64_t n, const float* C, i
         case 32: launch_assign<32>(X, n, C, nc, a); break;
         case 48: launch_assign<48>(X, n, C, nc, a); break;
         case 64: launch_assign<64>(X, n, C, nc, a); break;
+        case 96: launch_assign<96>(X, n, C, nc, a); break;
+        case 128: launch_assign<128>(X, n, C, nc, a); break;
         default: fprintf(stderr, "unsupported pca dims %d\n", DP); exit(1);
     }
 }
@@ -409,6 +414,8 @@ static void knn_dispatch(int DP, int K, const float* X, const float* Q, const in
         case 32: launch_knn_k<32>(K, X, Q, offs, probes, np, tiles, ntiles, I, Dd); break;
         case 48: launch_knn_k<48>(K, X, Q, offs, probes, np, tiles, ntiles, I, Dd); break;
         case 64: launch_knn_k<64>(K, X, Q, offs, probes, np, tiles, ntiles, I, Dd); break;
+        case 96: launch_knn_k<96>(K, X, Q, offs, probes, np, tiles, ntiles, I, Dd); break;
+        case 128: launch_knn_k<128>(K, X, Q, offs, probes, np, tiles, ntiles, I, Dd); break;
         default: fprintf(stderr, "unsupported pca dims %d\n", DP); exit(1);
     }
 }
@@ -894,6 +901,300 @@ static void run_tsne(float2* dY, int64_t N, int K, const int* dI, const float* d
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spherical embedding (--sphere R): points on a sphere of radius R in 3D, same cost with the Cauchy kernel on
+// chord distance. Repulsion comes from one 3D FFT over the cube around the sphere (cubic splat / gather, the
+// grid is fixed for the whole run); gradients are projected onto the tangent plane and each point is put back on
+// the sphere after its step.
+// ---------------------------------------------------------------------------------------------
+struct GridP3 { float x0, inv_h; int P; };  // cube [x0, x0 + G h)^3 on every axis, padded to P = 2G
+
+// cubic Lagrange weights for nodes -1, 0, 1, 2 around t in [0, 1)
+__device__ __forceinline__ void lagrange4(float t, float* w) {
+    w[0] = -t * (t - 1) * (t - 2) / 6; w[1] = (t + 1) * (t - 1) * (t - 2) / 2;
+    w[2] = -(t + 1) * t * (t - 2) / 2; w[3] = (t + 1) * t * (t - 1) / 6;
+}
+
+__global__ void k_splat3(const float4* Y, const float* mass, int64_t n, GridP3 g, float* grid) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float4 y = Y[i];
+    float u = (y.x - g.x0) * g.inv_h, v = (y.y - g.x0) * g.inv_h, s = (y.z - g.x0) * g.inv_h;
+    int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+    float wx[4], wy[4], wz[4];
+    lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+    float m = mass ? mass[i] : 1.f;
+    int64_t P = g.P, b = ((int64_t)(iz - 1) * P + (iy - 1)) * P + (ix - 1);
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            float wzy = m * wz[c] * wy[r];
+            float* row = grid + b + (c * P + r) * P;
+#pragma unroll
+            for (int q = 0; q < 4; q++) atomicAdd(row + q, wzy * wx[q]);
+        }
+}
+
+// kernel and its three gradient components on the periodic P^3 grid
+__global__ void k_kernel_grid3(float* k, int P, float h) {
+    int64_t PPP = (int64_t)P * P * P;
+    int64_t t = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (t >= PPP) return;
+    int c = t % P, r = (t / P) % P, l = t / ((int64_t)P * P);
+    int dx = c < P / 2 ? c : c - P, dy = r < P / 2 ? r : r - P, dz = l < P / 2 ? l : l - P;
+    float x = dx * h, y = dy * h, z = dz * h;
+    float w = 1.f / (1.f + x * x + y * y + z * z);
+    k[t] = w;
+    k[PPP + t] = (c == P / 2) ? 0.f : -2.f * x * w * w;
+    k[2 * PPP + t] = (r == P / 2) ? 0.f : -2.f * y * w * w;
+    k[3 * PPP + t] = (l == P / 2) ? 0.f : -2.f * z * w * w;
+}
+
+__global__ void k_specmul4(const cufftComplex* S, const cufftComplex* Kf, int64_t n, cufftComplex* out) {
+    int64_t t = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    cufftComplex s = S[t];
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        cufftComplex kk = Kf[k * n + t];
+        out[k * n + t] = make_float2(s.x * kk.x - s.y * kk.y, s.x * kk.y + s.y * kk.x);
+    }
+}
+
+// interpolates phi and grad phi at each point; accumulates Z = sum_i m_i (phi_i - m_i), taking the
+// interpolated self-interaction as the exact w(0) = 1
+__global__ void k_gather3(const float4* Y, const float* mass, int64_t n, GridP3 g, const float* field,
+                          float4* gphi, double* Z) {
+    __shared__ double sz[256];
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    double z = 0;
+    if (i < n) {
+        float4 y = Y[i];
+        float u = (y.x - g.x0) * g.inv_h, v = (y.y - g.x0) * g.inv_h, s = (y.z - g.x0) * g.inv_h;
+        int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+        float wx[4], wy[4], wz[4];
+        lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+        int64_t P = g.P, PPP = P * P * P, b = ((int64_t)(iz - 1) * P + (iy - 1)) * P + (ix - 1);
+        float r[4] = {0, 0, 0, 0};
+        for (int c = 0; c < 4; c++)
+            for (int rr = 0; rr < 4; rr++) {
+                float wzy = wz[c] * wy[rr];
+                int64_t o = b + (c * P + rr) * P;
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    float w = wzy * wx[q];
+#pragma unroll
+                    for (int k = 0; k < 4; k++) r[k] += w * field[k * PPP + o + q];
+                }
+            }
+        float m = mass ? mass[i] : 1.f;
+        z = (double)m * (r[0] - m);
+        gphi[i] = make_float4(r[1], r[2], r[3], 0.f);
+    }
+    sz[threadIdx.x] = z;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) { if (threadIdx.x < st) sz[threadIdx.x] += sz[threadIdx.x + st]; __syncthreads(); }
+    if (threadIdx.x == 0) atomicAdd(Z, sz[0]);
+}
+
+__global__ void k_attract3(const float4* __restrict__ Y, const int* __restrict__ I, const float* __restrict__ P,
+                           const int64_t* __restrict__ roff, const int* __restrict__ rsrc, const float* __restrict__ rp,
+                           int64_t n, int K, float4* attr) {
+    int64_t gt = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t i = gt >> 3; int lane = gt & 7;
+    bool valid = i < n;
+    float ax = 0, ay = 0, az = 0;
+    if (valid) {
+        float4 yi = Y[i];
+        for (int j = lane; j < K; j += 8) {
+            float p = P[i * K + j];
+            if (p == 0.f) continue;
+            float4 yj = Y[I[i * K + j]];
+            float dx = yi.x - yj.x, dy = yi.y - yj.y, dz = yi.z - yj.z;
+            float f = p / (1.f + dx * dx + dy * dy + dz * dz);
+            ax += f * dx; ay += f * dy; az += f * dz;
+        }
+        for (int64_t e = roff[i] + lane; e < roff[i + 1]; e += 8) {
+            float4 yj = Y[rsrc[e]];
+            float dx = yi.x - yj.x, dy = yi.y - yj.y, dz = yi.z - yj.z;
+            float f = rp[e] / (1.f + dx * dx + dy * dy + dz * dz);
+            ax += f * dx; ay += f * dy; az += f * dz;
+        }
+    }
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) {
+        ax += __shfl_xor_sync(0xffffffffu, ax, o); ay += __shfl_xor_sync(0xffffffffu, ay, o); az += __shfl_xor_sync(0xffffffffu, az, o);
+    }
+    if (valid && lane == 0) attr[i] = make_float4(ax, ay, az, 0.f);
+}
+
+// gradient projected onto the tangent plane; after the step the point goes back to radius R and the velocity
+// is made tangent again
+__global__ void k_update3(float4* Y, float4* upd, float4* gains, const float4* attr, const float4* gphi, const float* mass,
+                          int64_t n, float exag, const double* Z, float lr, float mom, float R) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float m = mass ? mass[i] : 1.f;
+    float rs = (float)(0.5 * m / *Z);
+    float4 a = attr[i], gp = gphi[i], y = Y[i];
+    float g[3] = {exag * a.x + rs * gp.x, exag * a.y + rs * gp.y, exag * a.z + rs * gp.z};
+    float n0[3] = {y.x / R, y.y / R, y.z / R};
+    float gd = g[0] * n0[0] + g[1] * n0[1] + g[2] * n0[2];
+    float4 u = upd[i], gn = gains[i];
+    float* uu = &u.x; float* gg = &gn.x; float* yy = &y.x;
+#pragma unroll
+    for (int c = 0; c < 3; c++) {
+        float gc = g[c] - gd * n0[c];
+        gg[c] = (signbit(gc) != signbit(uu[c])) ? gg[c] + 0.2f : fmaxf(gg[c] * 0.8f, 0.01f);
+        uu[c] = mom * uu[c] - lr * gg[c] * gc;
+        yy[c] += uu[c];
+    }
+    float s = R * rsqrtf(y.x * y.x + y.y * y.y + y.z * y.z);
+    y.x *= s; y.y *= s; y.z *= s;
+    float ud = (u.x * y.x + u.y * y.y + u.z * y.z) / (R * R);
+    u.x -= ud * y.x; u.y -= ud * y.y; u.z -= ud * y.z;
+    Y[i] = y; upd[i] = u; gains[i] = gn;
+}
+
+__global__ void k_exact_rep3(const float4* Y, const float* mass, int64_t n, const int* qs, int nq, double* out) {
+    __shared__ double s[4][256];
+    int q = qs[blockIdx.x];
+    float4 yq = Y[q];
+    double z = 0, fx = 0, fy = 0, fz = 0;
+    for (int64_t j = threadIdx.x; j < n; j += blockDim.x) {
+        if (j == q) continue;
+        float4 yj = Y[j];
+        float dx = yq.x - yj.x, dy = yq.y - yj.y, dz = yq.z - yj.z;
+        float w = 1.f / (1.f + dx * dx + dy * dy + dz * dz);
+        float m = mass ? mass[j] : 1.f;
+        z += m * w; fx += m * w * w * dx; fy += m * w * w * dy; fz += m * w * w * dz;
+    }
+    s[0][threadIdx.x] = z; s[1][threadIdx.x] = fx; s[2][threadIdx.x] = fy; s[3][threadIdx.x] = fz;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) for (int k = 0; k < 4; k++) s[k][threadIdx.x] += s[k][threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) for (int k = 0; k < 4; k++) out[blockIdx.x * 4 + k] = s[k][0];
+}
+
+// hierarchical sculpting: per rank, a spring toward the (re-normalised) centroid of the point's group
+struct Anchors { int nr = 0; int* lab = nullptr; int* offs = nullptr; float* w = nullptr; float4* cent = nullptr; int total = 0; };
+
+__global__ void k_cent_acc(const float4* Y, int64_t n, Anchors a) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float4 y = Y[i];
+    for (int r = 0; r < a.nr; r++) {
+        int g = a.lab[r * n + i];
+        if (g < 0) continue;
+        float4* c = a.cent + a.offs[r] + g;
+        atomicAdd(&c->x, y.x); atomicAdd(&c->y, y.y); atomicAdd(&c->z, y.z);
+    }
+}
+
+__global__ void k_anchor(const float4* Y, int64_t n, Anchors a, float R, float invN, float4* attr) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float4 y = Y[i], f = attr[i];
+    for (int r = 0; r < a.nr; r++) {
+        int g = a.lab[r * n + i];
+        if (g < 0) continue;
+        float4 c = a.cent[a.offs[r] + g];
+        float l = sqrtf(c.x * c.x + c.y * c.y + c.z * c.z);
+        if (!(l > 0)) continue;
+        float s = R / l, wr = a.w[r] * invN;
+        f.x += wr * (y.x - c.x * s); f.y += wr * (y.y - c.y * s); f.z += wr * (y.z - c.z * s);
+    }
+    attr[i] = f;
+}
+
+static void run_tsne_sphere(float4* dY, int64_t N, int K, const int* dI, const float* dP, const float* dMass, const Opts& o,
+                            const Anchors& an) {
+    const float R = o.sphere;
+    int64_t* roff; int* rsrc; float* rp;
+    build_reverse(dI, dP, N, K, roff, rsrc, rp);
+    // grid: the cube around the sphere with one cell of margin; h grows if the padded grid would exceed max-grid
+    int Gmax = o.max_grid / 2;
+    float h = std::max(o.h, (2 * R) / (Gmax - 6));
+    int G = fft_size((int)ceilf(2 * R / h) + 6);
+    if (G > Gmax) G = Gmax;
+    int P = 2 * G;
+    int64_t PPP = (int64_t)P * P * P, PC = (int64_t)P * P * (P / 2 + 1);
+    GridP3 gp; gp.x0 = -0.5f * G * h; gp.inv_h = 1.f / h; gp.P = P;
+    float *grid, *out; cufftComplex *spec, *kspec, *ospec;
+    CK(cudaMalloc(&grid, PPP * 4)); CK(cudaMalloc(&out, 4 * PPP * 4));
+    CK(cudaMalloc(&spec, PC * 8)); CK(cudaMalloc(&kspec, 4 * PC * 8)); CK(cudaMalloc(&ospec, 4 * PC * 8));
+    cufftHandle r2c, r2c4, c2r4;
+    int dims[3] = {P, P, P};
+    CKFFT(cufftPlan3d(&r2c, P, P, P, CUFFT_R2C));
+    CKFFT(cufftPlanMany(&r2c4, 3, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_R2C, 4));
+    CKFFT(cufftPlanMany(&c2r4, 3, dims, nullptr, 1, 0, nullptr, 1, 0, CUFFT_C2R, 4));
+    k_kernel_grid3<<<(PPP + 255) / 256, 256>>>(out, P, h);  // out doubles as scratch for the kernel
+    CKFFT(cufftExecR2C(r2c4, out, kspec));
+    k_scale_c<<<(4 * PC + 255) / 256, 256>>>(kspec, 4 * PC, 1.f / (float)PPP);
+    LOG("sphere R %.1f: grid %d^3 (padded %d^3), h %.3f, %.1f GB", R, G, P, h, (PPP * 20 + PC * 72) / 1e9);
+
+    float4 *dU, *dG, *dA, *dGp; double* dZ;
+    CK(cudaMalloc(&dU, N * 16)); CK(cudaMalloc(&dG, N * 16)); CK(cudaMalloc(&dA, N * 16)); CK(cudaMalloc(&dGp, N * 16));
+    CK(cudaMalloc(&dZ, 8));
+    CK(cudaMemset(dU, 0, N * 16));
+    std::vector<float4> ones(N, make_float4(1, 1, 1, 1));
+    CK(cudaMemcpy(dG, ones.data(), N * 16, cudaMemcpyHostToDevice));
+    int nb = (int)((N + 255) / 256), nb8 = (int)((N * 8 + 255) / 256);
+    float lr = o.lr > 0 ? o.lr : std::max(200.f, (float)N / o.ee);
+    int total = o.ee_iters + o.iters;
+    for (int it = 0; it < total; it++) {
+        bool ee = it < o.ee_iters;
+        float exag = ee ? o.ee : o.exag, mom = ee ? 0.5f : 0.8f;
+        CK(cudaMemsetAsync(grid, 0, PPP * 4));
+        k_splat3<<<nb, 256>>>(dY, dMass, N, gp, grid);
+        CKFFT(cufftExecR2C(r2c, grid, spec));
+        k_specmul4<<<(PC + 255) / 256, 256>>>(spec, kspec, PC, ospec);
+        CKFFT(cufftExecC2R(c2r4, ospec, out));
+        CK(cudaMemsetAsync(dZ, 0, 8));
+        k_gather3<<<nb, 256>>>(dY, dMass, N, gp, out, dGp, dZ);
+        k_attract3<<<nb8, 256>>>(dY, dI, dP, roff, rsrc, rp, N, K, dA);
+        if (an.nr) {
+            CK(cudaMemsetAsync(an.cent, 0, (size_t)an.total * 16));
+            k_cent_acc<<<nb, 256>>>(dY, N, an);
+            k_anchor<<<nb, 256>>>(dY, N, an, R, 1.f / (float)N, dA);
+        }
+        if (o.check_grad > 0 && (it == o.ee_iters - 1 || it == total - 1)) {
+            CK(cudaDeviceSynchronize());
+            int nq = std::min<int64_t>(o.check_grad, N);
+            std::mt19937 r2(7); std::vector<int> qs(nq); for (auto& q : qs) q = (int)(r2() % N);
+            int* dQ; double* dO; CK(cudaMalloc(&dQ, nq * 4)); CK(cudaMalloc(&dO, nq * 4 * 8));
+            CK(cudaMemcpy(dQ, qs.data(), nq * 4, cudaMemcpyHostToDevice));
+            k_exact_rep3<<<nq, 256>>>(dY, dMass, N, dQ, nq, dO);
+            std::vector<double> ex(nq * 4); CK(cudaMemcpy(ex.data(), dO, nq * 32, cudaMemcpyDeviceToHost));
+            std::vector<float4> gpv(N); CK(cudaMemcpy(gpv.data(), dGp, N * 16, cudaMemcpyDeviceToHost));
+            std::vector<float> mv(N, 1.f); if (dMass) CK(cudaMemcpy(mv.data(), dMass, N * 4, cudaMemcpyDeviceToHost));
+            double zh; CK(cudaMemcpy(&zh, dZ, 8, cudaMemcpyDeviceToHost));
+            double num = 0, den = 0, zsum = 0;
+            for (int q = 0; q < nq; q++) {
+                double a[3] = {-0.5 * gpv[qs[q]].x, -0.5 * gpv[qs[q]].y, -0.5 * gpv[qs[q]].z};
+                for (int c = 0; c < 3; c++) { num += (a[c] - ex[q * 4 + 1 + c]) * (a[c] - ex[q * 4 + 1 + c]); den += ex[q * 4 + 1 + c] * ex[q * 4 + 1 + c]; }
+                zsum += mv[qs[q]] * ex[q * 4];
+            }
+            LOG("grad check it %d: rel. error of repulsive force %.4f, Z grid %.4g vs sampled exact %.4g", it, sqrt(num / den), zh, zsum / nq * N);
+            cudaFree(dQ); cudaFree(dO);
+        }
+        k_update3<<<nb, 256>>>(dY, dU, dG, dA, dGp, dMass, N, exag, dZ, lr, mom, R);
+        if (it == 0) { size_t fr, tt; cudaMemGetInfo(&fr, &tt); LOG("GPU memory in use: %.1f GB of %.1f GB (incl. other processes)", (tt - fr) / 1e9, tt / 1e9); }
+        if (it % 50 == 0 || it == total - 1) {
+            CK(cudaDeviceSynchronize());
+            double z; CK(cudaMemcpy(&z, dZ, 8, cudaMemcpyDeviceToHost));
+            LOG("iter %4d  Z/N %.4g", it, z / N);
+        }
+        if (it == o.ee_iters - 1) CK(cudaMemset(dU, 0, N * 16));
+    }
+    CK(cudaDeviceSynchronize());
+    cufftDestroy(r2c); cufftDestroy(r2c4); cufftDestroy(c2r4);
+    cudaFree(grid); cudaFree(out); cudaFree(spec); cudaFree(kspec); cudaFree(ospec);
+    cudaFree(dU); cudaFree(dG); cudaFree(dA); cudaFree(dGp); cudaFree(dZ);
+    cudaFree(roff); cudaFree(rsrc); cudaFree(rp);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Label propagation on the kNN graph (weights p_{j|i}); half of the nodes update per sweep to avoid oscillation
 // ---------------------------------------------------------------------------------------------
 template <int K>
@@ -1008,6 +1309,38 @@ __global__ void k_place(const int* I, const float* W, int64_t n, int K, const fl
     out[i] = y;
 }
 
+// the same on a sphere of radius R: chord distances, each fixed-point step projected back onto the sphere
+__global__ void k_place3(const int* I, const float* W, int64_t n, int K, const float4* Yr, float R, float2* out) {
+    int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int* nb = I + i * K; const float* w = W + i * K;
+    float best = INFINITY; float4 y = make_float4(NAN, NAN, NAN, 0);
+    for (int a = 0; a < K; a++) {
+        if (!(w[a] > 0)) continue;
+        float4 c = Yr[nb[a]];
+        float obj = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float4 r = Yr[nb[j]]; float dx = c.x - r.x, dy = c.y - r.y, dz = c.z - r.z;
+            obj += w[j] * log1pf(dx * dx + dy * dy + dz * dz);
+        }
+        if (obj < best) { best = obj; y = c; }
+    }
+    if (best == INFINITY) { out[i] = make_float2(NAN, NAN); return; }
+    for (int it = 0; it < 20; it++) {
+        float sx = 0, sy = 0, sz = 0;
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            float4 r = Yr[nb[j]]; float dx = y.x - r.x, dy = y.y - r.y, dz = y.z - r.z;
+            float u = w[j] / (1.f + dx * dx + dy * dy + dz * dz);
+            sx += u * r.x; sy += u * r.y; sz += u * r.z;
+        }
+        float s = R * rsqrtf(sx * sx + sy * sy + sz * sz);
+        y = make_float4(sx * s, sy * s, sz * s, 0);
+    }
+    out[i] = make_float2(atan2f(y.y, y.x) * 57.29578f, asinf(fmaxf(-1.f, fminf(1.f, y.z / R))) * 57.29578f);
+}
+
 // Streams the inputs in batches: same transform + PCA as the reference, kNN against the reference with the
 // reference's inverted file, then each point goes to the attraction minimum over its neighbours' positions (k_place).
 static void run_project(const Opts& o) {
@@ -1019,6 +1352,16 @@ static void run_project(const Opts& o) {
     float *dX, *dC; float2* dYr; int *dOffs, *dProbes;
     CK(cudaMalloc(&dX, m.X.size() * 4)); CK(cudaMemcpy(dX, m.X.data(), m.X.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dYr, m.N * 8)); CK(cudaMemcpy(dYr, m.Y.data(), m.N * 8, cudaMemcpyHostToDevice));
+    float4* dYr3 = nullptr;
+    if (m.R > 0) {  // lon, lat -> points on the sphere
+        std::vector<float4> y3(m.N);
+        for (int64_t i = 0; i < m.N; i++) {
+            float lo = m.Y[2 * i] / 57.29578f, la = m.Y[2 * i + 1] / 57.29578f;
+            y3[i] = make_float4(m.R * cosf(la) * cosf(lo), m.R * cosf(la) * sinf(lo), m.R * sinf(la), 0.f);
+        }
+        CK(cudaMalloc(&dYr3, m.N * 16)); CK(cudaMemcpy(dYr3, y3.data(), m.N * 16, cudaMemcpyHostToDevice));
+        LOG("spherical model, radius %.1f", m.R);
+    }
     CK(cudaMalloc(&dC, m.C.size() * 4)); CK(cudaMemcpy(dC, m.C.data(), m.C.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dOffs, (m.nc + 1) * 4)); CK(cudaMemcpy(dOffs, m.offs.data(), (m.nc + 1) * 4, cudaMemcpyHostToDevice));
     CK(cudaMalloc(&dProbes, (size_t)m.nc * np * 4));
@@ -1038,7 +1381,7 @@ static void run_project(const Opts& o) {
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
     std::vector<char> buf(1 << 20);
     setvbuf(f, buf.data(), _IOFBF, buf.size());
-    fputs("id\tx\ty\tnn_dist\n", f);
+    fputs(m.R > 0 ? "id\tlon\tlat\tnn_dist\n" : "id\tx\ty\tnn_dist\n", f);
     int64_t total = 0;
     double t0 = now();
     for (size_t b = 0; b < batches.size(); b++) {
@@ -1075,7 +1418,8 @@ static void run_project(const Opts& o) {
         CK(cudaMemcpy2D(nn.data(), 4, dDd, K * 4, 4, n, cudaMemcpyDeviceToHost));
         k_perplexity<<<(n + 255) / 256, 256>>>(dDd, dI, n, K, logf(o.proj_perp), false, 1.f, nullptr);
         float2* dOut; CK(cudaMalloc(&dOut, n * 8));
-        k_place<<<(n + 255) / 256, 256>>>(dI, dDd, n, K, dYr, dOut);
+        if (dYr3) k_place3<<<(n + 255) / 256, 256>>>(dI, dDd, n, K, dYr3, m.R, dOut);
+        else k_place<<<(n + 255) / 256, 256>>>(dI, dDd, n, K, dYr, dOut);
         std::vector<float2> Yq(n), Yo(n);
         CK(cudaMemcpy(Yq.data(), dOut, n * 8, cudaMemcpyDeviceToHost));
         std::vector<float> nno(n);
@@ -1104,7 +1448,7 @@ int main(int argc, char** argv) {
     if (!o.write_fsb.empty()) { write_fsb_file(d, o.write_fsb); return 0; }
     const int64_t N = d.N;
     int DP = std::max(8, (std::min(o.pca, d.D) + 7) / 8 * 8);
-    if (DP > 48) DP = 64; else if (DP > 32) DP = 48;
+    if (DP > 96) DP = 128; else if (DP > 64) DP = 96; else if (DP > 48) DP = 64; else if (DP > 32) DP = 48;
     cublasHandle_t blas; CKBLAS(cublasCreate(&blas));
     Model model;
     float* dX = transform_pca(d, o, DP, blas, model.mu, model.Vp);
@@ -1126,6 +1470,15 @@ int main(int argc, char** argv) {
         idim.resize(N); share.resize(N);
         CK(cudaMemcpy(idim.data(), a, N * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(share.data(), b, N * 4, cudaMemcpyDeviceToHost));
         cudaFree(a); cudaFree(b);
+    }
+    if (!o.knn_out.empty()) {
+        std::vector<int> I((size_t)N * K), Io((size_t)N * K);
+        CK(cudaMemcpy(I.data(), dI, I.size() * 4, cudaMemcpyDeviceToHost));
+        for (int64_t i = 0; i < N; i++) for (int j = 0; j < K; j++) Io[(size_t)perm[i] * K + j] = perm[I[(size_t)i * K + j]];
+        FILE* g = fopen(o.knn_out.c_str(), "wb");
+        if (!g) { fprintf(stderr, "cannot write %s\n", o.knn_out.c_str()); exit(1); }
+        fwrite(Io.data(), 4, Io.size(), g); fclose(g);
+        LOG("wrote kNN graph %s (%lld x %d)", o.knn_out.c_str(), (long long)N, K);
     }
     float* dSig; CK(cudaMalloc(&dSig, N * 4));
     k_perplexity<<<(N + 255) / 256, 256>>>(dD, dI, N, K, logf(o.perplexity), o.uniform, 0.5f / (float)N, dSig);
@@ -1214,20 +1567,66 @@ int main(int argc, char** argv) {
         model.X.resize((size_t)N * DP);
         CK(cudaMemcpy(model.X.data(), dX, model.X.size() * 4, cudaMemcpyDeviceToHost));
     }
+    std::vector<float4> Y3;
+    if (o.sphere) {  // init: direction of the first three PCs
+        if (o.sphere < 0) o.sphere = sqrtf((float)N) / 12.f;
+        std::vector<float> p3(N * 3);
+        CK(cudaMemcpy2D(p3.data(), 12, dX, DP * 4, 12, N, cudaMemcpyDeviceToHost));
+        Y3.resize(N);
+        for (int64_t i = 0; i < N; i++) {
+            float x = p3[3 * i], y = p3[3 * i + 1], z = p3[3 * i + 2], r = sqrtf(x * x + y * y + z * z);
+            if (!(r > 0)) { x = 1; y = z = 0; r = 1; }
+            Y3[i] = make_float4(o.sphere * x / r, o.sphere * y / r, o.sphere * z / r, 0.f);
+        }
+    }
     CK(cudaFree(dX));
-    float2* dY; CK(cudaMalloc(&dY, N * 8));
-    CK(cudaMemcpy(dY, pc.data(), N * 8, cudaMemcpyHostToDevice));
-
+    std::vector<float2> Y(N);
     double t_opt = now();
-    run_tsne(dY, N, K, dI, dD, dMass, o);
+    if (o.sphere) {
+        float4* dY3; CK(cudaMalloc(&dY3, N * 16));
+        CK(cudaMemcpy(dY3, Y3.data(), N * 16, cudaMemcpyHostToDevice));
+        Anchors an;
+        if (!o.anchor_file.empty()) {
+            std::vector<int> v;
+            FILE* f = fopen(o.anchor_file.c_str(), "r");
+            if (!f) { fprintf(stderr, "cannot open %s\n", o.anchor_file.c_str()); exit(1); }
+            int x; while (fscanf(f, "%d", &x) == 1) v.push_back(x); fclose(f);
+            if (v.size() % N) { fprintf(stderr, "anchor file has %zu values, not a multiple of %lld rows\n", v.size(), (long long)N); exit(1); }
+            an.nr = (int)(v.size() / N);
+            if ((int)o.anchor_w.size() != an.nr) { fprintf(stderr, "--anchor needs %d weights (one per rank column)\n", an.nr); exit(1); }
+            std::vector<int> lab((size_t)an.nr * N), offs(an.nr);
+            for (int r = 0; r < an.nr; r++) {
+                int mx = -1;
+                for (int64_t i = 0; i < N; i++) { lab[(size_t)r * N + i] = v[(size_t)perm[i] * an.nr + r]; mx = std::max(mx, lab[(size_t)r * N + i]); }
+                offs[r] = an.total; an.total += mx + 1;
+            }
+            CK(cudaMalloc(&an.lab, lab.size() * 4)); CK(cudaMemcpy(an.lab, lab.data(), lab.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&an.offs, an.nr * 4)); CK(cudaMemcpy(an.offs, offs.data(), an.nr * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&an.w, an.nr * 4)); CK(cudaMemcpy(an.w, o.anchor_w.data(), an.nr * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&an.cent, (size_t)std::max(1, an.total) * 16));
+            LOG("anchors: %d ranks, %d groups", an.nr, an.total);
+        }
+        run_tsne_sphere(dY3, N, K, dI, dD, dMass, o, an);
+        if (an.nr) { cudaFree(an.lab); cudaFree(an.offs); cudaFree(an.w); cudaFree(an.cent); }
+        CK(cudaMemcpy(Y3.data(), dY3, N * 16, cudaMemcpyDeviceToHost));
+        cudaFree(dY3);
+        for (int64_t i = 0; i < N; i++) {  // lon, lat in degrees
+            float4 y = Y3[i];
+            Y[i] = make_float2(atan2f(y.y, y.x) * 57.29578f, asinf(fmaxf(-1.f, fminf(1.f, y.z / o.sphere))) * 57.29578f);
+        }
+    } else {
+        float2* dY; CK(cudaMalloc(&dY, N * 8));
+        CK(cudaMemcpy(dY, pc.data(), N * 8, cudaMemcpyHostToDevice));
+        run_tsne(dY, N, K, dI, dD, dMass, o);
+        CK(cudaMemcpy(Y.data(), dY, N * 8, cudaMemcpyDeviceToHost));
+        cudaFree(dY);
+    }
     LOG("optimisation done in %.1fs", now() - t_opt);
     { size_t fr, tt; cudaMemGetInfo(&fr, &tt); LOG("GPU memory in use at end: %.1f GB of %.1f GB (incl. other processes)", (tt - fr) / 1e9, tt / 1e9); }
-
-    std::vector<float2> Y(N);
-    CK(cudaMemcpy(Y.data(), dY, N * 8, cudaMemcpyDeviceToHost));
     if (!o.save_model.empty()) {
         model.N = N; model.D = d.D; model.DP = DP; model.nc = (int)model.C.size() / DP;
         model.mode = o.transform == "clr" ? 0 : o.transform == "sqrt" ? 1 : 2;
+        model.R = o.sphere;
         model.Y.resize((size_t)N * 2);
         memcpy(model.Y.data(), Y.data(), N * 8);
         save_model(o.save_model, model);
@@ -1240,7 +1639,7 @@ int main(int argc, char** argv) {
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
     std::vector<char> buf(1 << 20);
     setvbuf(f, buf.data(), _IOFBF, buf.size());
-    fputs("id\tx\ty\n", f);
+    fputs(o.sphere ? "id\tlon\tlat\n" : "id\tx\ty\n", f);
     for (int64_t i = 0; i < N; i++) {
         fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], f);
         fprintf(f, "\t%.4f\t%.4f\n", Yo[i].x, Yo[i].y);

@@ -50,8 +50,9 @@ struct Opts {
     float ee = 12.f;
     float exag = 1.f;           // exaggeration after the early phase
     float lr = -1;              // default N/ee
-    float h = 0.25f;            // grid spacing in embedding units
-    int max_grid = 8192;        // max padded FFT size
+    float h = -1;               // grid spacing in embedding units (0.25; sphere 0.5)
+    int max_grid = -1;          // max padded FFT size (8192; sphere 512, per axis)
+    float sphere = 0;           // embed on a sphere of this radius (0 = plane, -1 = auto)
     double sample = 1.0;        // keep each row with this probability
     uint64_t seed = 1;
     int threads = 0;
@@ -63,9 +64,12 @@ struct Opts {
     double shrink_ref = 0;      // groups larger than this are shrunk (default max(100, N/1000))
     int lp_sweeps = 30;
     std::string groups_out;     // write label-propagation groups
+    std::string knn_out;        // write the kNN graph: N x k int32 neighbour row numbers, input order
     std::string diag;           // write per-point kNN radius diagnostics
     float mass_min = 0.02f;
     std::string mass_file;      // optional per-row masses (one float per line, input order)
+    std::string anchor_file;    // sphere: per-row group ids, one column per rank (input order; -1 = none)
+    std::vector<float> anchor_w;  // spring weight toward the group centroid, per rank
     bool write_pca = false;
     int64_t pca_sample = 1000000;  // CPU: rows used for the PCA covariance
     int cluster_size = -1;      // CPU: target kNN fine-cluster size
@@ -374,6 +378,56 @@ static void jacobi_eigen(std::vector<double>& A, int n, std::vector<double>& V, 
     ev.resize(n); for (int i = 0; i < n; i++) ev[i] = A[(size_t)i * n + i];
 }
 
+// leading eigenvectors of a symmetric n x n matrix (row-major): Jacobi for small n, otherwise subspace
+// iteration on want + 32 vectors (multithreaded products, Gram-Schmidt) and a Rayleigh-Ritz step. Same output
+// layout as jacobi_eigen (V n x n, column j = eigenvector j); eigenvalues past the computed ones are -inf.
+static void sym_eigen(std::vector<double>& A, int n, int want, std::vector<double>& V, std::vector<double>& ev) {
+    if (n <= 256) { jacobi_eigen(A, n, V, ev); return; }
+    const int L = std::min(n, want + 32);
+    std::vector<double> Q((size_t)n * L), Z((size_t)n * L);  // row-major n x L
+    std::mt19937_64 rng(5); std::normal_distribution<double> nd;
+    for (auto& q : Q) q = nd(rng);
+    int nt = std::max(1u, std::thread::hardware_concurrency());
+    auto mul = [&](const std::vector<double>& X, std::vector<double>& Y) {  // Y = A X
+        std::vector<std::thread> th;
+        for (int t = 0; t < nt; t++) th.emplace_back([&, t]() {
+            std::vector<double> acc(L);
+            for (int i = t; i < n; i += nt) {
+                std::fill(acc.begin(), acc.end(), 0.0);
+                const double* a = &A[(size_t)i * n];
+                for (int k = 0; k < n; k++) { double v = a[k]; const double* x = &X[(size_t)k * L]; for (int j = 0; j < L; j++) acc[j] += v * x[j]; }
+                std::copy(acc.begin(), acc.end(), &Y[(size_t)i * L]);
+            }
+        });
+        for (auto& x : th) x.join();
+    };
+    auto orth = [&](std::vector<double>& X) {  // modified Gram-Schmidt on the columns
+        for (int j = 0; j < L; j++) {
+            for (int p = 0; p < j; p++) {
+                double d = 0; for (int i = 0; i < n; i++) d += X[(size_t)i * L + j] * X[(size_t)i * L + p];
+                for (int i = 0; i < n; i++) X[(size_t)i * L + j] -= d * X[(size_t)i * L + p];
+            }
+            double nr = 0; for (int i = 0; i < n; i++) nr += X[(size_t)i * L + j] * X[(size_t)i * L + j];
+            nr = 1 / sqrt(std::max(nr, 1e-300)); for (int i = 0; i < n; i++) X[(size_t)i * L + j] *= nr;
+        }
+    };
+    orth(Q);
+    for (int it = 0; it < 60; it++) { mul(Q, Z); std::swap(Q, Z); orth(Q); }
+    mul(Q, Z);
+    std::vector<double> B((size_t)L * L), W, e;  // B = Q^T A Q
+    for (int a = 0; a < L; a++) for (int b = 0; b < L; b++) {
+        double d = 0; for (int i = 0; i < n; i++) d += Q[(size_t)i * L + a] * Z[(size_t)i * L + b];
+        B[(size_t)a * L + b] = d;
+    }
+    for (int a = 0; a < L; a++) for (int b = 0; b < a; b++) B[(size_t)a * L + b] = B[(size_t)b * L + a] = 0.5 * (B[(size_t)a * L + b] + B[(size_t)b * L + a]);
+    jacobi_eigen(B, L, W, e);
+    V.assign((size_t)n * n, 0); ev.assign(n, -INFINITY);
+    for (int j = 0; j < L; j++) {
+        ev[j] = e[j];
+        for (int i = 0; i < n; i++) { double d = 0; for (int a = 0; a < L; a++) d += Q[(size_t)i * L + a] * W[(size_t)a * L + j]; V[(size_t)i * n + j] = d; }
+    }
+}
+
 
 static int fft_size(int need) {
     // smallest 2^a 3^b >= need
@@ -386,10 +440,12 @@ static int fft_size(int need) {
 
 struct Model {
     int64_t N = 0; int D = 0, DP = 0, nc = 0, mode = 0;
-    std::vector<float> mu, Vp, C, X, Y;   // X: N x DP (cluster order), Y: N x 2 (same order)
+    std::vector<float> mu, Vp, C, X, Y;   // X: N x DP (cluster order), Y: N x 2 (same order; lon, lat on a sphere)
     std::vector<int> offs;
+    float R = 0;                          // sphere radius, 0 for a planar map
 };
 static const char MODEL_MAGIC[8] = {'F', 'S', 'N', 'E', 'M', 'D', 'L', '1'};
+static const char MODEL_MAGIC2[8] = {'F', 'S', 'N', 'E', 'M', 'D', 'L', '2'};  // spherical: radius follows the header
 
 static void wr(FILE* f, const void* p, size_t n) { if (n && fwrite(p, 1, n, f) != n) { fprintf(stderr, "write error\n"); exit(1); } }
 static void rd(FILE* f, void* p, size_t n) { if (n && fread(p, 1, n, f) != n) { fprintf(stderr, "model file truncated\n"); exit(1); } }
@@ -397,9 +453,10 @@ static void rd(FILE* f, void* p, size_t n) { if (n && fread(p, 1, n, f) != n) { 
 static void save_model(const std::string& path, const Model& m) {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
-    wr(f, MODEL_MAGIC, 8);
+    wr(f, m.R > 0 ? MODEL_MAGIC2 : MODEL_MAGIC, 8);
     int64_t hdr[5] = {m.N, m.D, m.DP, m.nc, m.mode};
     wr(f, hdr, sizeof hdr);
+    if (m.R > 0) wr(f, &m.R, 4);
     wr(f, m.mu.data(), m.mu.size() * 4); wr(f, m.Vp.data(), m.Vp.size() * 4); wr(f, m.C.data(), m.C.size() * 4);
     wr(f, m.offs.data(), m.offs.size() * 4); wr(f, m.X.data(), m.X.size() * 4); wr(f, m.Y.data(), m.Y.size() * 4);
     fclose(f);
@@ -409,8 +466,10 @@ static void load_model(const std::string& path, Model& m) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); exit(1); }
     char mg[8]; rd(f, mg, 8);
-    if (memcmp(mg, MODEL_MAGIC, 8)) { fprintf(stderr, "%s is not a fastsne model\n", path.c_str()); exit(1); }
+    bool sph = !memcmp(mg, MODEL_MAGIC2, 8);
+    if (!sph && memcmp(mg, MODEL_MAGIC, 8)) { fprintf(stderr, "%s is not a fastsne model\n", path.c_str()); exit(1); }
     int64_t hdr[5]; rd(f, hdr, sizeof hdr);
+    m.R = 0; if (sph) rd(f, &m.R, 4);
     m.N = hdr[0]; m.D = (int)hdr[1]; m.DP = (int)hdr[2]; m.nc = (int)hdr[3]; m.mode = (int)hdr[4];
     m.mu.resize(m.D); m.Vp.resize((size_t)m.D * m.DP); m.C.resize((size_t)m.nc * m.DP); m.offs.resize(m.nc + 1);
     m.X.resize((size_t)m.N * m.DP); m.Y.resize((size_t)m.N * 2);
@@ -425,7 +484,7 @@ static void usage() {
         "fastsne -i input.tsv [-i more.tsv | -i @filelist] -o out.tsv [options]\n"
         "  input rows: id<TAB>v1<TAB>v2... (header lines are skipped)\n"
         "  --transform clr|sqrt|none   per-row transform (clr)\n"
-        "  --pca N            PCA dimensions (32; 8..64)\n"
+        "  --pca N            PCA dimensions (32; 8..128)\n"
         "  --k N              neighbours (48; 16,32,48,64,96)\n"
         "  --perplexity P     (k/3)    --uniform   uniform kNN affinities\n"
         "  --clusters N --nprobe N     kNN inverted file (N/1000, 32)\n"
@@ -434,6 +493,10 @@ static void usage() {
         "  --exag X           exaggeration after the early phase (1)\n"
         "  --lr X             learning rate (N/12)\n"
         "  --h X              repulsion grid spacing (0.25)   --max-grid N (8192)\n"
+        "  --sphere R|auto    embed on a sphere of radius R (GPU only; auto = sqrt(N)/12); output id lon lat\n"
+        "                     (degrees). Defaults change to --h 0.5 --max-grid 512 (padded 3D FFT per axis)\n"
+        "  --anchor-file F --anchor W1,W2,..  sphere: pull each point toward the centroid of its group at each rank\n"
+        "                     (F: whitespace-separated group ids, one row per input row, one column per rank, -1 = none)\n"
         "  --shrink G         shrink big homogeneous groups: kNN label-propagation groups with n > ref points\n"
         "                     get repulsion mass (ref/n)^G, so their area grows like n^(1-G) (0 = off; try 0.5)\n"
         "  --dedup A          shrink chain-like redundant groups (neighbours share most of their neighbours, e.g.\n"
@@ -442,6 +505,8 @@ static void usage() {
         "  --dedup-margin T   (0.3)\n"
         "  --shrink-ref N     (max(100, N/1000))   --mass-min M (0.02)   --lp-sweeps N (30)\n"
         "  --groups FILE      write label-propagation group per id\n"
+        "  --write-knn FILE   write the kNN graph (GPU): N x k int32 neighbour row numbers (0-based, input order,\n"
+        "                     nearest first), raw little-endian\n"
         "  --mass-file F      per-row masses, one per line in input order\n"
         "  --sample F         keep each row with probability F\n"
         "  --seed N --threads N --check-knn NQ --check-grad NQ\n"
@@ -476,6 +541,7 @@ static void parse_args(int argc, char** argv, Opts& o) {
         else if (a == "--lr") o.lr = atof(nx().c_str());
         else if (a == "--h") o.h = atof(nx().c_str());
         else if (a == "--max-grid") o.max_grid = atoi(nx().c_str());
+        else if (a == "--sphere") { std::string v = nx(); o.sphere = v == "auto" ? -1.f : (float)atof(v.c_str()); if (o.sphere == 0) usage(); }
         else if (a == "--sample") o.sample = atof(nx().c_str());
         else if (a == "--seed") o.seed = strtoull(nx().c_str(), 0, 10);
         else if (a == "--threads") o.threads = atoi(nx().c_str());
@@ -487,9 +553,12 @@ static void parse_args(int argc, char** argv, Opts& o) {
         else if (a == "--shrink-ref") o.shrink_ref = atof(nx().c_str());
         else if (a == "--lp-sweeps") o.lp_sweeps = atoi(nx().c_str());
         else if (a == "--groups") o.groups_out = nx();
+        else if (a == "--write-knn") o.knn_out = nx();
         else if (a == "--diag") o.diag = nx();
         else if (a == "--mass-min") o.mass_min = atof(nx().c_str());
         else if (a == "--mass-file") o.mass_file = nx();
+        else if (a == "--anchor-file") o.anchor_file = nx();
+        else if (a == "--anchor") { std::string v = nx(); for (size_t p0 = 0; p0 <= v.size();) { size_t p1 = v.find(',', p0); if (p1 == std::string::npos) p1 = v.size(); o.anchor_w.push_back((float)atof(v.substr(p0, p1 - p0).c_str())); p0 = p1 + 1; } }
         else if (a == "--write-pca") o.write_pca = true;
         else if (a == "--save-model") o.save_model = nx();
         else if (a == "--project") o.project = nx();
@@ -503,6 +572,8 @@ static void parse_args(int argc, char** argv, Opts& o) {
     }
     if (o.inputs.empty()) usage();
     if (o.perplexity <= 0) o.perplexity = o.k / 3.f;
+    if (o.h <= 0) o.h = o.sphere != 0 ? 0.5f : 0.25f;
+    if (o.max_grid <= 0) o.max_grid = o.sphere != 0 ? 512 : 8192;
     if (o.nprobe > 0) o.nprobe = std::max(1, std::min(o.nprobe, 64));
 }
 
