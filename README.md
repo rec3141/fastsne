@@ -7,7 +7,7 @@ Prebuilt Linux x86-64 binaries are attached to each [release](https://github.com
 `fastsne_cpu` (fully static; AVX-512 / AVX2 / generic builds, picked at run time).
 
 ```
-v=v0.2.1; f=fastsne-$v-linux-x86_64.tar.gz
+v=v0.2.2; f=fastsne-$v-linux-x86_64.tar.gz
 curl -fsSLO https://github.com/rec3141/fastsne/releases/download/$v/$f
 curl -fsSL https://github.com/rec3141/fastsne/releases/download/$v/$f.sha256 | sha256sum -c
 tar -xzf $f --strip-components=1 -C /usr/local      # bin/, share/fastsne/ (viewer, tools)
@@ -141,6 +141,30 @@ On the marine assembly (reference = 50% sample), all 1.55M contigs projected in 
 - 9.6 for random pairs.
 
 The model file is about 136 B per reference point (32-d PCA + 2-d position), i.e. about 4 GB for 30M.
+
+## Spherical maps (`--sphere`)
+
+`--sphere R` embeds on a sphere of radius R instead of a plane (GPU build): the same cost with the Cauchy kernel on
+chord distance, repulsion from one 3D FFT over the sphere's bounding cube with cubic interpolation, gradients
+projected onto the tangent plane. Output is `id lon lat` in degrees. On 905,628 SILVA SSU sequences (5-mer counts,
+`--transform sqrt --pca 128`) R 35 with `--h 0.28` keeps the repulsive force error near 1% on the default 512^3
+grid and takes about 50 s on a GV100; at h 0.5 the error is about 8%.
+
+```
+./fastsne -i refs.fsb -o globe.tsv --transform sqrt --pca 128 --sphere 35 --h 0.28 --save-model globe.model
+```
+
+- `--anchor-file F --anchor W1,W2,..` adds a weak spring from each point toward the centroid of its group at each
+  rank (F: whitespace-separated group ids, one row per input row, one column per rank, -1 = none). Domain / phylum /
+  class / order at 0.001, 0.0005, 0.00025, 0.000125 gathers domains into continents and phyla into countries
+  while sequence similarity still sets the detail; ten times stronger pulls each domain into a small cap.
+- Spherical models project like planar ones (`--project`, either build); each fixed-point step is put back on the
+  sphere.
+- `--fixed-y MAP` skips the optimisation and takes positions from an existing map by id (`id x y`, or `id lon lat`
+  with `--sphere R`). Saving that as a model places new points by different features with the same map, e.g.
+  amplicons (V4, V9, ...) with references cut to the amplicon region: on held-out SILVA sequences a 253 bp V4
+  region lands within one unit of its full-length position 77% of the time.
+- `--pca` goes up to 128 on the GPU; `--write-knn FILE` writes the kNN graph (N x k int32 row numbers, input order).
 
 ## How it works
 
