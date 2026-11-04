@@ -691,6 +691,33 @@ static F2 place_point(const int* nb, const float* w, int K, const float* Yr) {
     return y;
 }
 
+// the same on a sphere of radius R (Y3: reference points as x, y, z): chord distances, each fixed-point step put
+// back on the sphere; returns lon, lat in degrees
+static F2 place_point_sphere(const int* nb, const float* w, int K, const float* Y3, float R) {
+    float best = INFINITY, y[3] = {NAN, NAN, NAN};
+    auto d2 = [&](const float* p, const float* q) { float a = p[0] - q[0], b = p[1] - q[1], c = p[2] - q[2]; return a * a + b * b + c * c; };
+    for (int a = 0; a < K; a++) {
+        if (!(w[a] > 0)) continue;
+        const float* c = Y3 + 3 * (size_t)nb[a];
+        float obj = 0;
+        for (int j = 0; j < K; j++) if (w[j] > 0) obj += w[j] * log1pf(d2(c, Y3 + 3 * (size_t)nb[j]));
+        if (obj < best) { best = obj; y[0] = c[0]; y[1] = c[1]; y[2] = c[2]; }
+    }
+    if (best == INFINITY) return {NAN, NAN};
+    for (int it = 0; it < 20; it++) {
+        float s[3] = {0, 0, 0};
+        for (int j = 0; j < K; j++) {
+            if (!(w[j] > 0)) continue;
+            const float* r = Y3 + 3 * (size_t)nb[j];
+            float u = w[j] / (1.f + d2(y, r));
+            s[0] += u * r[0]; s[1] += u * r[1]; s[2] += u * r[2];
+        }
+        float l = R / sqrtf(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+        y[0] = s[0] * l; y[1] = s[1] * l; y[2] = s[2] * l;
+    }
+    return {atan2f(y[1], y[0]) * 57.29578f, asinf(fmaxf(-1.f, fminf(1.f, y[2] / R))) * 57.29578f};
+}
+
 // Streams the inputs in batches: same transform + PCA as the reference, nearest reference cluster, kNN against the
 // reference's inverted file, then each point goes to the attraction minimum over its neighbours' positions.
 // Reads models written by either build.
@@ -706,6 +733,15 @@ static void run_project_cpu(const Opts& o) {
     IVF Vc;
     { std::vector<int> o1 = {0, nc}; std::vector<float> c0(DP, 0.f); ivf_build(Vc, m.C.data(), o1, c0, 1, DP, 1); }
     LOG("reference index built (%d probes)", V.np);
+    std::vector<float> Y3;
+    if (m.R > 0) {  // spherical model: lon, lat -> points on the sphere
+        Y3.resize((size_t)m.N * 3);
+        for (int64_t i = 0; i < m.N; i++) {
+            float lo = m.Y[2 * i] / 57.29578f, la = m.Y[2 * i + 1] / 57.29578f;
+            Y3[3 * i] = m.R * cosf(la) * cosf(lo); Y3[3 * i + 1] = m.R * cosf(la) * sinf(lo); Y3[3 * i + 2] = m.R * sinf(la);
+        }
+        LOG("spherical model, radius %.1f", m.R);
+    }
 
     std::vector<std::string> files = expand_inputs(o);
     std::vector<std::vector<std::string>> batches(1);
@@ -719,7 +755,7 @@ static void run_project_cpu(const Opts& o) {
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
     std::vector<char> buf(1 << 20);
     setvbuf(f, buf.data(), _IOFBF, buf.size());
-    fputs("id\tx\ty\tnn_dist\n", f);
+    fputs(m.R > 0 ? "id\tlon\tlat\tnn_dist\n" : "id\tx\ty\tnn_dist\n", f);
     int64_t total = 0;
     double t0 = now();
     for (size_t b = 0; b < batches.size(); b++) {
@@ -759,7 +795,7 @@ static void run_project_cpu(const Opts& o) {
             float* dd = &Dd[i * K];
             float nn = sqrtf(dd[0]);
             perplexity_row(dd, K, logf(o.proj_perp), false, 1.f);
-            Yo[pm[i]] = place_point(&I[i * K], dd, K, m.Y.data());
+            Yo[pm[i]] = m.R > 0 ? place_point_sphere(&I[i * K], dd, K, Y3.data(), m.R) : place_point(&I[i * K], dd, K, m.Y.data());
             nno[pm[i]] = nn;
         }
         for (int64_t i = 0; i < n; i++) {
@@ -784,7 +820,7 @@ int main(int argc, char** argv) {
     }
     Opts o;
     parse_args(argc, argv, o);
-    if (o.sphere != 0) { fprintf(stderr, "--sphere needs the GPU build (fastsne)\n"); return 1; }
+    if (o.sphere != 0 && o.project.empty()) { fprintf(stderr, "--sphere embedding needs the GPU build (fastsne); spherical models project on either\n"); return 1; }
     if (o.threads > 0) omp_set_num_threads(o.threads);
     if (o.nprobe < 0) o.nprobe = 32;
     if (o.refine < 0) o.refine = 1;
