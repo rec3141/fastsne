@@ -7,7 +7,7 @@ Prebuilt Linux x86-64 binaries are attached to each [release](https://github.com
 `fastsne_cpu` (fully static; AVX-512 / AVX2 / generic builds, picked at run time).
 
 ```
-v=v0.2.2; f=fastsne-$v-linux-x86_64.tar.gz
+v=v0.3.0; f=fastsne-$v-linux-x86_64.tar.gz
 curl -fsSLO https://github.com/rec3141/fastsne/releases/download/$v/$f
 curl -fsSL https://github.com/rec3141/fastsne/releases/download/$v/$f.sha256 | sha256sum -c
 tar -xzf $f --strip-components=1 -C /usr/local      # bin/, share/fastsne/ (viewer, tools)
