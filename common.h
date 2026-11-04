@@ -64,6 +64,7 @@ struct Opts {
     double shrink_ref = 0;      // groups larger than this are shrunk (default max(100, N/1000))
     int lp_sweeps = 30;
     std::string groups_out;     // write label-propagation groups
+    std::string fixed_y;        // take positions from this map (id, x|lon, y|lat) instead of optimising
     std::string knn_out;        // write the kNN graph: N x k int32 neighbour row numbers, input order
     std::string diag;           // write per-point kNN radius diagnostics
     float mass_min = 0.02f;
@@ -511,6 +512,8 @@ static void usage() {
         "  --sample F         keep each row with probability F\n"
         "  --seed N --threads N --check-knn NQ --check-grad NQ\n"
         "  --save-model FILE  save the reference for later projection\n"
+        "  --fixed-y MAP      no optimisation: positions come from MAP (id, x, y; or id, lon, lat with --sphere R),\n"
+        "                     e.g. to place amplicons with a model built from the same references cut to that region\n"
         "  fastsne_cpu only: --pca-sample N (1000000) --cluster-size N (kNN fine clusters)\n"
         "  --write-fsb FILE   convert all inputs (after --sample) to one binary .fsb file and exit\n"
         "projection: fastsne --project model.bin -i @files.txt -o placed.tsv [--proj-k 16] [--proj-perp 5]\n"
@@ -554,6 +557,7 @@ static void parse_args(int argc, char** argv, Opts& o) {
         else if (a == "--lp-sweeps") o.lp_sweeps = atoi(nx().c_str());
         else if (a == "--groups") o.groups_out = nx();
         else if (a == "--write-knn") o.knn_out = nx();
+        else if (a == "--fixed-y") o.fixed_y = nx();
         else if (a == "--diag") o.diag = nx();
         else if (a == "--mass-min") o.mass_min = atof(nx().c_str());
         else if (a == "--mass-file") o.mass_file = nx();

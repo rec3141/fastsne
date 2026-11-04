@@ -15,6 +15,8 @@
 
 #include "common.h"
 
+#include <unordered_map>
+
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <cublas_v2.h>
@@ -1582,7 +1584,27 @@ int main(int argc, char** argv) {
     CK(cudaFree(dX));
     std::vector<float2> Y(N);
     double t_opt = now();
-    if (o.sphere) {
+    if (!o.fixed_y.empty()) {
+        // positions from an existing map, matched by id
+        std::unordered_map<std::string, float2> pos;
+        FILE* f = fopen(o.fixed_y.c_str(), "r");
+        if (!f) { fprintf(stderr, "cannot open %s\n", o.fixed_y.c_str()); exit(1); }
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            char* t1 = strchr(line, '\t'); if (!t1) continue;
+            *t1 = 0; float a, b;
+            if (sscanf(t1 + 1, "%f\t%f", &a, &b) == 2) pos[line] = make_float2(a, b);
+        }
+        fclose(f);
+        int64_t miss = 0;
+        for (int64_t i = 0; i < N; i++) {
+            int64_t r = perm[i];
+            auto it = pos.find(std::string(d.ids.data() + d.idoff[r], d.idoff[r + 1] - d.idoff[r]));
+            if (it == pos.end()) { miss++; Y[i] = make_float2(NAN, NAN); } else Y[i] = it->second;
+        }
+        if (miss) { fprintf(stderr, "%lld of %lld input rows have no position in %s\n", (long long)miss, (long long)N, o.fixed_y.c_str()); exit(1); }
+        LOG("positions from %s", o.fixed_y.c_str());
+    } else if (o.sphere) {
         float4* dY3; CK(cudaMalloc(&dY3, N * 16));
         CK(cudaMemcpy(dY3, Y3.data(), N * 16, cudaMemcpyHostToDevice));
         Anchors an;
