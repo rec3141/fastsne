@@ -8,6 +8,9 @@
 //     points stays cheap; candidates are stored dimension-major per cluster and scanned in 4-query x
 //     16-candidate register tiles
 //   - repulsion: same single-splat FFT field (FFTW), bilinear splat (per-thread grids while the field is small)
+//   - --sphere: same 3D FFT field as the GPU, with in-place transforms that skip the empty part of the padded grid
+//     (~40% less FFT work) and real-valued kernel spectra (half the FFT memory); the cubic splat uses atomics on
+//     points in kNN-cluster order
 //   - --project: brute-force nearest reference cluster, then the same tiled scan over its probe list
 //   - neighbour rows are re-sorted by index after the affinities, which speeds up both the attraction
 //     loop (memory order) and the neighbour-overlap measure used by --dedup (sorted-list intersection)
@@ -15,6 +18,7 @@
 #include "common.h"
 #include <omp.h>
 #include <fftw3.h>
+#include <unordered_map>
 
 struct F2 { float x, y; };
 // native-width float vectors for the kNN scan tile (GCC lowers wider generic vectors through the stack);
@@ -494,29 +498,32 @@ static inline void atomic_addf(float* p, float v) {
     *p += v;
 }
 
+// reverse CSR of the kNN graph (in-edges per point, edges with p > 0) by counting sort
+static void build_reverse(int64_t N, int K, const std::vector<int>& I, const std::vector<float>& Pw,
+                          std::vector<int64_t>& roff, std::vector<int>& rsrc, std::vector<float>& rp) {
+    roff.assign(N + 1, 0);
+    std::vector<std::atomic<int>> cnt(N);
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < N; i++) cnt[i].store(0, std::memory_order_relaxed);
+#pragma omp parallel for schedule(static)
+    for (int64_t e = 0; e < N * K; e++) if (Pw[e] > 0) cnt[I[e]].fetch_add(1, std::memory_order_relaxed);
+    for (int64_t i = 0; i < N; i++) roff[i + 1] = roff[i] + cnt[i].load(std::memory_order_relaxed);
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < N; i++) cnt[i].store(0, std::memory_order_relaxed);
+    rsrc.assign(roff[N], 0); rp.assign(roff[N], 0);
+#pragma omp parallel for schedule(static)
+    for (int64_t e = 0; e < N * K; e++) {
+        if (!(Pw[e] > 0)) continue;
+        int dst = I[e];
+        int64_t pos = roff[dst] + cnt[dst].fetch_add(1, std::memory_order_relaxed);
+        rsrc[pos] = (int)(e / K); rp[pos] = Pw[e];
+    }
+}
+
 static void run_tsne_cpu(std::vector<F2>& Y, int64_t N, int K, const std::vector<int>& I, const std::vector<float>& Pw,
                          const std::vector<float>& mass, const Opts& o) {
-    // reverse edges (in-edges) by counting sort
-    std::vector<int64_t> roff(N + 1, 0);
-    std::vector<int> rsrc; std::vector<float> rp;
-    {
-        std::vector<std::atomic<int>> cnt(N);
-#pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < N; i++) cnt[i].store(0, std::memory_order_relaxed);
-#pragma omp parallel for schedule(static)
-        for (int64_t e = 0; e < N * K; e++) if (Pw[e] > 0) cnt[I[e]].fetch_add(1, std::memory_order_relaxed);
-        for (int64_t i = 0; i < N; i++) roff[i + 1] = roff[i] + cnt[i].load(std::memory_order_relaxed);
-#pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < N; i++) cnt[i].store(0, std::memory_order_relaxed);
-        rsrc.assign(roff[N], 0); rp.assign(roff[N], 0);
-#pragma omp parallel for schedule(static)
-        for (int64_t e = 0; e < N * K; e++) {
-            if (!(Pw[e] > 0)) continue;
-            int dst = I[e];
-            int64_t pos = roff[dst] + cnt[dst].fetch_add(1, std::memory_order_relaxed);
-            rsrc[pos] = (int)(e / K); rp[pos] = Pw[e];
-        }
-    }
+    std::vector<int64_t> roff; std::vector<int> rsrc; std::vector<float> rp;
+    build_reverse(N, K, I, Pw, roff, rsrc, rp);
     const bool hasm = !mass.empty();
     std::vector<F2> U(N, {0, 0}), Gn(N, {1, 1}), A(N), Gp(N);
     FieldCPU F;
@@ -638,7 +645,29 @@ static void run_tsne_cpu(std::vector<F2>& Y, int64_t N, int K, const std::vector
             }
             A[i] = {ax, ay};
         }
-        double t2 = now();
+        double t2 = now(), tchk = 0;   // the check is left out of the timings
+        if (o.check_grad > 0 && (it == o.ee_iters - 1 || it == total - 1)) {
+            // exact repulsion for a few points vs the grid field (same check as the GPU build)
+            int nq = (int)std::min<int64_t>(o.check_grad, N);
+            std::mt19937 r2(7); std::vector<int> qs(nq); for (auto& q : qs) q = (int)(r2() % N);
+            double num = 0, den = 0, zsum = 0;
+            for (int q : qs) {
+                double z = 0, fx = 0, fy = 0;
+#pragma omp parallel for reduction(+:z,fx,fy) schedule(static)
+                for (int64_t j = 0; j < N; j++) {
+                    if (j == q) continue;
+                    float dx = Y[q].x - Y[j].x, dy = Y[q].y - Y[j].y, w = 1.f / (1.f + dx * dx + dy * dy), m = hasm ? mass[j] : 1.f;
+                    z += m * w; fx += m * w * w * dx; fy += m * w * w * dy;
+                }
+                double ax = -0.5 * Gp[q].x, ay = -0.5 * Gp[q].y;
+                num += (ax - fx) * (ax - fx) + (ay - fy) * (ay - fy); den += fx * fx + fy * fy;
+                zsum += (hasm ? mass[q] : 1.f) * z;
+            }
+            LOG("grad check it %d: rel. error of repulsive force %.4f, Z grid %.4g vs sampled exact %.4g (h=%.3f, P=%d)",
+                it, sqrt(num / den), Z, zsum / nq * N, h, P);
+            tchk = now() - t2;
+            t2 = now();
+        }
 #pragma omp parallel for schedule(static)
         for (int64_t i = 0; i < N; i++) {
             float m = hasm ? mass[i] : 1.f, rs = (float)(0.5 * m / Z);
@@ -651,13 +680,333 @@ static void run_tsne_cpu(std::vector<F2>& Y, int64_t N, int K, const std::vector
         }
         if (it == o.ee_iters - 1) std::fill(U.begin(), U.end(), F2{0, 0});
         double t3 = now();
-        t_rep += t1 - t0; t_fft += tf2 - tf1; t_att += t2 - t1; t_upd += t3 - t2;
+        t_rep += t1 - t0; t_fft += tf2 - tf1; t_att += t2 - t1 - tchk; t_upd += t3 - t2;
         if (it % 100 == 0 || it == total - 1)
             LOG("iter %4d  extent %8.2f  grid %5d  h %.3f  Z/N %.4g  (%.0f ms/iter: repulsion %.0f [fft %.0f], attraction %.0f)", it, ext, P, h, Z / N,
-                1e3 * (t3 - t0), 1e3 * (t1 - t0), 1e3 * (tf2 - tf1), 1e3 * (t2 - t1));
+                1e3 * (t3 - t0 - tchk), 1e3 * (t1 - t0), 1e3 * (tf2 - tf1), 1e3 * (t2 - t1 - tchk));
     }
     LOG("optimisation time: repulsion %.1fs (FFT %.1fs), attraction %.1fs, update %.1fs", t_rep, t_fft, t_att, t_upd);
     F.release();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spherical embedding (--sphere R), the GPU's run_tsne_sphere on the CPU: points on a sphere of radius R in 3D,
+// Cauchy kernel on chord distance. Repulsion from one 3D FFT over the cube around the sphere (cubic Lagrange
+// splat / gather; the grid is fixed for the whole run); gradients projected onto the tangent plane, each point put
+// back on the sphere after its step. Optional springs toward per-rank group centroids (--anchor-file).
+// CPU specifics: in-place FFTW transforms pruned to the occupied corner (PrunedFFT3), and the kernel spectra kept
+// as one real array each (the potential kernel is even, so its spectrum is real; the gradient kernels are odd, so
+// theirs are imaginary), which takes the FFT buffers to 28 bytes per padded cell (3.8 GB at the default 512^3)
+// instead of the GPU's 56.
+// ---------------------------------------------------------------------------------------------
+struct F3 { float x, y, z; };
+
+// cubic Lagrange weights for nodes -1, 0, 1, 2 around t in [0, 1)
+static inline void lagrange4(float t, float* w) {
+    w[0] = -t * (t - 1) * (t - 2) / 6; w[1] = (t + 1) * (t - 1) * (t - 2) / 2;
+    w[2] = -(t + 1) * t * (t - 2) / 2; w[3] = (t + 1) * t * (t - 1) / 6;
+}
+
+// --anchor-file: per rank r, lab[r * N + i] = group of point i (cluster order, -1 = none), groups of rank r are
+// offs[r] .. offs[r] + (number of groups) - 1 in the centroid array; w[r] = spring weight
+struct AnchorsCPU { int nr = 0, total = 0; std::vector<int> lab, offs; std::vector<float> w; };
+
+// The density is non-zero only in the [0, G)^3 corner of the padded P^3 grid (P = 2G), and only that corner of the
+// convolution is read back, so each 3D transform runs as three 1D passes that skip the empty (forward) or unread
+// (inverse) part: x over G^2 rows, y over G planes, z over everything, about 58% of the work of a full transform.
+// In-place layout: P x P rows of Pc = P/2+1 complex values (2 Pc floats as real rows).
+struct PrunedFFT3 {
+    fftwf_plan fx = nullptr, fy = nullptr, fz = nullptr, iz = nullptr, iy = nullptr, ix = nullptr;
+    // forward plans made on a, inverse plans on b (arrays of P * P * Pc complex values, FFTW-allocated)
+    void plan(int P, int G, fftwf_complex* a, fftwf_complex* b, unsigned flags) {
+        const int Pc = P / 2 + 1, Ps = 2 * Pc;
+        fftwf_iodim d, h[2];
+        d = {P, 1, 1}; h[0] = {G, P * Ps, P * Pc}; h[1] = {G, Ps, Pc};          // x: rows z < G, y < G
+        fx = fftwf_plan_guru_dft_r2c(1, &d, 2, h, (float*)a, a, flags);
+        d = {P, 1, 1}; h[0] = {G, P * Pc, P * Ps}; h[1] = {G, Pc, Ps};
+        ix = fftwf_plan_guru_dft_c2r(1, &d, 2, h, b, (float*)b, flags);
+        d = {P, Pc, Pc}; h[0] = {G, P * Pc, P * Pc}; h[1] = {Pc, 1, 1};         // y: planes z < G
+        fy = fftwf_plan_guru_dft(1, &d, 2, h, a, a, FFTW_FORWARD, flags);
+        iy = fftwf_plan_guru_dft(1, &d, 2, h, b, b, FFTW_BACKWARD, flags);
+        d = {P, P * Pc, P * Pc}; h[0] = {P * Pc, 1, 1};                          // z: all P * Pc columns
+        fz = fftwf_plan_guru_dft(1, &d, 1, h, a, a, FFTW_FORWARD, flags);
+        iz = fftwf_plan_guru_dft(1, &d, 1, h, b, b, FFTW_BACKWARD, flags);
+        if (!fx || !fy || !fz || !ix || !iy || !iz) { fprintf(stderr, "FFTW planning failed\n"); exit(1); }
+    }
+    void forward(fftwf_complex* a) const { fftwf_execute_dft_r2c(fx, (float*)a, a); fftwf_execute_dft(fy, a, a); fftwf_execute_dft(fz, a, a); }
+    void inverse(fftwf_complex* b) const { fftwf_execute_dft(iz, b, b); fftwf_execute_dft(iy, b, b); fftwf_execute_dft_c2r(ix, b, (float*)b); }
+    void release() { for (fftwf_plan q : {fx, fy, fz, ix, iy, iz}) if (q) fftwf_destroy_plan(q); }
+};
+
+static void run_tsne_sphere_cpu(std::vector<F3>& Y, int64_t N, int K, const std::vector<int>& I, const std::vector<float>& Pw,
+                                const std::vector<float>& mass, const Opts& o, const AnchorsCPU& an) {
+    const float R = o.sphere;
+    std::vector<int64_t> roff; std::vector<int> rsrc; std::vector<float> rp;
+    build_reverse(N, K, I, Pw, roff, rsrc, rp);
+    const bool hasm = !mass.empty();
+    const int nthr = omp_get_max_threads();
+    // grid: the cube around the sphere with three cells of margin; h grows if the padded grid would exceed max-grid
+    const int Gmax = o.max_grid / 2;
+    const float h = std::max(o.h, (2 * R) / (Gmax - 6));
+    int G = fft_size((int)ceilf(2 * R / h) + 6);
+    if (G > Gmax) G = Gmax;
+    const int P = 2 * G, Pc = P / 2 + 1, Ps = 2 * Pc;   // Ps: padded row length of the in-place real arrays
+    const size_t PC = (size_t)P * P * Pc;                // complex values per spectrum
+    const float x0 = -0.5f * G * h, ih = 1.f / h;
+    fftwf_complex* grid = fftwf_alloc_complex(PC);       // density (padded real), then its spectrum
+    fftwf_complex* out[4];                               // product spectra, then phi and grad phi (padded real)
+    for (auto& a : out) a = fftwf_alloc_complex(PC);
+    float* ksp = fftwf_alloc_real(4 * PC);               // kernel spectra: Re (phi), Im (d/dx, d/dy, d/dz), scaled
+    if (!grid || !out[0] || !out[1] || !out[2] || !out[3] || !ksp) { fprintf(stderr, "cannot allocate the %d^3 FFT grid\n", P); exit(1); }
+    fftwf_plan_with_nthreads(nthr);
+    // the grid is fixed for the whole run, so measured plans pay off (planning overwrites the buffers: done first)
+    double tp = now();
+    PrunedFFT3 F;
+    F.plan(P, G, grid, out[0], FFTW_MEASURE);
+    fftwf_plan r2cf = fftwf_plan_dft_r2c_3d(P, P, P, (float*)grid, grid, FFTW_ESTIMATE);   // for the kernels only
+    LOG("FFT plans (%d^3): %.1fs", P, now() - tp);
+    auto zero = [&](fftwf_complex* a) {
+#pragma omp parallel for schedule(static)
+        for (int l = 0; l < P; l++) memset(a + (size_t)l * P * Pc, 0, (size_t)P * Pc * 8);
+    };
+    {
+        float* g = (float*)grid;
+        double kept = 0, dropped = 0;
+        const float sc = 1.f / ((float)P * P * P);
+        for (int k = 0; k < 4; k++) {
+#pragma omp parallel for schedule(static)
+            for (int l = 0; l < P; l++)
+                for (int r = 0; r < P; r++) {
+                    int dz = l < P / 2 ? l : l - P, dy = r < P / 2 ? r : r - P;
+                    float* row = g + ((size_t)l * P + r) * Ps;
+                    for (int c = 0; c < P; c++) {
+                        int dx = c < P / 2 ? c : c - P;
+                        float x = dx * h, y = dy * h, z = dz * h, w = 1.f / (1.f + x * x + y * y + z * z);
+                        row[c] = k == 0 ? w : k == 1 ? (c == P / 2 ? 0.f : -2.f * x * w * w)
+                               : k == 2 ? (r == P / 2 ? 0.f : -2.f * y * w * w) : (l == P / 2 ? 0.f : -2.f * z * w * w);
+                    }
+                }
+            fftwf_execute(r2cf);   // the kernels fill the whole grid: full transform
+            double kk = 0, kd = 0;
+#pragma omp parallel for reduction(max:kk,kd) schedule(static)
+            for (size_t t = 0; t < PC; t++) {
+                float re = grid[t][0], im = grid[t][1];
+                ksp[k * PC + t] = (k == 0 ? re : im) * sc;
+                kk = std::max(kk, (double)fabsf(k == 0 ? re : im)); kd = std::max(kd, (double)fabsf(k == 0 ? im : re));
+            }
+            kept = std::max(kept, kk); dropped = std::max(dropped, kd);
+        }
+        if (dropped > 1e-4 * kept) LOG("warning: kernel spectra not real/imaginary (%.2g of max)", dropped / kept);
+    }
+    LOG("sphere R %.1f: grid %d^3 (padded %d^3), h %.3f, %.1f GB", R, G, P, h, PC * 56 / 1e9);
+
+    std::vector<F3> U(N, {0, 0, 0}), Gn(N, {1, 1, 1}), A(N), Gp(N);
+    std::vector<double> cacc;
+    std::vector<float> cent;
+    if (an.nr) { cacc.resize((size_t)nthr * an.total * 3); cent.resize((size_t)an.total * 3); }
+    const float lr = o.lr > 0 ? o.lr : std::max(200.f, (float)N / o.ee);
+    const int total = o.ee_iters + o.iters;
+    double t_spl = 0, t_fft = 0, t_gat = 0, t_att = 0, t_upd = 0;
+    for (int it = 0; it < total; it++) {
+        bool ee = it < o.ee_iters;
+        float exag = ee ? o.ee : o.exag, mom = ee ? 0.5f : 0.8f;
+        double t0 = now();
+        zero(grid);
+        float* g = (float*)grid;
+        // splat (atomics: points are in kNN-cluster order, so a thread's points mostly share cells with each other)
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            F3 y = Y[i];
+            float u = (y.x - x0) * ih, v = (y.y - x0) * ih, s = (y.z - x0) * ih;
+            int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+            float wx[4], wy[4], wz[4];
+            lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+            float m = hasm ? mass[i] : 1.f;
+            size_t b = ((size_t)(iz - 1) * P + (iy - 1)) * Ps + (ix - 1);
+            for (int c = 0; c < 4; c++)
+                for (int r = 0; r < 4; r++) {
+                    float wzy = m * wz[c] * wy[r];
+                    float* row = g + b + ((size_t)c * P + r) * Ps;
+                    for (int q = 0; q < 4; q++) atomic_addf(row + q, wzy * wx[q]);
+                }
+        }
+        double t1 = now();
+        F.forward(grid);
+#pragma omp parallel for schedule(static)
+        for (size_t t = 0; t < PC; t++) {
+            float sr = grid[t][0], si = grid[t][1], k0 = ksp[t];
+            out[0][t][0] = sr * k0; out[0][t][1] = si * k0;
+            for (int k = 1; k < 4; k++) { float kk = ksp[k * PC + t]; out[k][t][0] = -si * kk; out[k][t][1] = sr * kk; }
+        }
+        for (int k = 0; k < 4; k++) F.inverse(out[k]);
+        double t2 = now();
+        // gather phi and grad phi; Z = sum_i m_i (phi_i - m_i), the self-interaction taken as the exact w(0) = 1
+        const float* fo[4] = {(const float*)out[0], (const float*)out[1], (const float*)out[2], (const float*)out[3]};
+        double Z = 0;
+#pragma omp parallel for reduction(+:Z) schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            F3 y = Y[i];
+            float u = (y.x - x0) * ih, v = (y.y - x0) * ih, s = (y.z - x0) * ih;
+            int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+            float wx[4], wy[4], wz[4];
+            lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+            size_t b = ((size_t)(iz - 1) * P + (iy - 1)) * Ps + (ix - 1);
+            float r4[4] = {0, 0, 0, 0};
+            for (int c = 0; c < 4; c++)
+                for (int rr = 0; rr < 4; rr++) {
+                    float wzy = wz[c] * wy[rr];
+                    const size_t o = b + ((size_t)c * P + rr) * Ps;
+                    for (int q = 0; q < 4; q++) {
+                        float w = wzy * wx[q];
+                        for (int k = 0; k < 4; k++) r4[k] += w * fo[k][o + q];
+                    }
+                }
+            float m = hasm ? mass[i] : 1.f;
+            Z += (double)m * (r4[0] - m);
+            Gp[i] = {r4[1], r4[2], r4[3]};
+        }
+        double t3 = now();
+        // attraction over out- and in-edges
+#pragma omp parallel for schedule(dynamic, 4096)
+        for (int64_t i = 0; i < N; i++) {
+            F3 yi = Y[i]; float ax = 0, ay = 0, az = 0;
+            const int* nb = &I[i * K]; const float* pw = &Pw[i * K];
+            for (int j = 0; j < K; j++) {
+                float p = pw[j]; if (p == 0.f) continue;
+                F3 q = Y[nb[j]]; float dx = yi.x - q.x, dy = yi.y - q.y, dz = yi.z - q.z, f = p / (1.f + dx * dx + dy * dy + dz * dz);
+                ax += f * dx; ay += f * dy; az += f * dz;
+            }
+            for (int64_t e = roff[i]; e < roff[i + 1]; e++) {
+                F3 q = Y[rsrc[e]]; float dx = yi.x - q.x, dy = yi.y - q.y, dz = yi.z - q.z, f = rp[e] / (1.f + dx * dx + dy * dy + dz * dz);
+                ax += f * dx; ay += f * dy; az += f * dz;
+            }
+            A[i] = {ax, ay, az};
+        }
+        if (an.nr) {
+            // group centroids (per-thread sums), then a spring toward each re-normalised centroid, added to the
+            // attraction (so it is exaggerated with it, as on the GPU)
+            const size_t T3 = (size_t)an.total * 3;
+#pragma omp parallel
+            {
+                double* c = cacc.data() + T3 * omp_get_thread_num();
+                std::fill(c, c + T3, 0.0);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < N; i++)
+                    for (int r = 0; r < an.nr; r++) {
+                        int gr = an.lab[(size_t)r * N + i];
+                        if (gr < 0) continue;
+                        double* cc = c + 3 * (size_t)(an.offs[r] + gr);
+                        cc[0] += Y[i].x; cc[1] += Y[i].y; cc[2] += Y[i].z;
+                    }
+#pragma omp for schedule(static)
+                for (size_t t = 0; t < T3; t++) { double sum = 0; for (int th = 0; th < nthr; th++) sum += cacc[T3 * th + t]; cent[t] = (float)sum; }
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < N; i++) {
+                    F3 y = Y[i], f = A[i];
+                    for (int r = 0; r < an.nr; r++) {
+                        int gr = an.lab[(size_t)r * N + i];
+                        if (gr < 0) continue;
+                        const float* cc = &cent[3 * (size_t)(an.offs[r] + gr)];
+                        float l = sqrtf(cc[0] * cc[0] + cc[1] * cc[1] + cc[2] * cc[2]);
+                        if (!(l > 0)) continue;
+                        float s = R / l, wr = an.w[r] * (1.f / (float)N);
+                        f.x += wr * (y.x - cc[0] * s); f.y += wr * (y.y - cc[1] * s); f.z += wr * (y.z - cc[2] * s);
+                    }
+                    A[i] = f;
+                }
+            }
+        }
+        double t4 = now();
+        if (o.check_grad > 0 && (it == o.ee_iters - 1 || it == total - 1)) {
+            int nq = (int)std::min<int64_t>(o.check_grad, N);
+            std::mt19937 r2(7); std::vector<int> qs(nq); for (auto& q : qs) q = (int)(r2() % N);
+            double num = 0, den = 0, zsum = 0;
+            for (int q : qs) {
+                double z = 0, fx = 0, fy = 0, fz = 0;
+                const F3 yq = Y[q];
+#pragma omp parallel for reduction(+:z,fx,fy,fz) schedule(static)
+                for (int64_t j = 0; j < N; j++) {
+                    if (j == q) continue;
+                    float dx = yq.x - Y[j].x, dy = yq.y - Y[j].y, dz = yq.z - Y[j].z;
+                    float w = 1.f / (1.f + dx * dx + dy * dy + dz * dz), m = hasm ? mass[j] : 1.f;
+                    z += m * w; fx += m * w * w * dx; fy += m * w * w * dy; fz += m * w * w * dz;
+                }
+                double a[3] = {-0.5 * Gp[q].x, -0.5 * Gp[q].y, -0.5 * Gp[q].z}, ex[3] = {fx, fy, fz};
+                for (int c = 0; c < 3; c++) { num += (a[c] - ex[c]) * (a[c] - ex[c]); den += ex[c] * ex[c]; }
+                zsum += (hasm ? mass[q] : 1.f) * z;
+            }
+            LOG("grad check it %d: rel. error of repulsive force %.4f, Z grid %.4g vs sampled exact %.4g", it, sqrt(num / den), Z, zsum / nq * N);
+        }
+        double tu = now();   // the check is left out of the timings
+        // tangent-plane step; the point goes back to radius R and the velocity is made tangent again
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            float m = hasm ? mass[i] : 1.f, rs = (float)(0.5 * m / Z);
+            F3 a = A[i], gp = Gp[i], y = Y[i], u = U[i], gn = Gn[i];
+            float gv[3] = {exag * a.x + rs * gp.x, exag * a.y + rs * gp.y, exag * a.z + rs * gp.z};
+            float n0[3] = {y.x / R, y.y / R, y.z / R};
+            float gd = gv[0] * n0[0] + gv[1] * n0[1] + gv[2] * n0[2];
+            float* uu = &u.x; float* gg = &gn.x; float* yy = &y.x;
+            for (int c = 0; c < 3; c++) {
+                float gc = gv[c] - gd * n0[c];
+                gg[c] = (std::signbit(gc) != std::signbit(uu[c])) ? gg[c] + 0.2f : std::max(gg[c] * 0.8f, 0.01f);
+                uu[c] = mom * uu[c] - lr * gg[c] * gc;
+                yy[c] += uu[c];
+            }
+            float s = R / sqrtf(y.x * y.x + y.y * y.y + y.z * y.z);
+            y.x *= s; y.y *= s; y.z *= s;
+            float ud = (u.x * y.x + u.y * y.y + u.z * y.z) / (R * R);
+            u.x -= ud * y.x; u.y -= ud * y.y; u.z -= ud * y.z;
+            Y[i] = y; U[i] = u; Gn[i] = gn;
+        }
+        if (it == o.ee_iters - 1) std::fill(U.begin(), U.end(), F3{0, 0, 0});
+        double t5 = now();
+        t_spl += t1 - t0; t_fft += t2 - t1; t_gat += t3 - t2; t_att += t4 - t3; t_upd += t5 - tu;
+        if (it % 50 == 0 || it == total - 1)
+            LOG("iter %4d  Z/N %.4g  (%.0f ms/iter: splat %.0f, fft %.0f, gather %.0f, attraction%s %.0f)", it, Z / N,
+                1e3 * (t5 - tu + t4 - t0), 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2), an.nr ? " + anchors" : "", 1e3 * (t4 - t3));
+    }
+    LOG("optimisation time: splat %.1fs, FFT %.1fs, gather %.1fs, attraction%s %.1fs, update %.1fs", t_spl, t_fft, t_gat,
+        an.nr ? " + anchors" : "", t_att, t_upd);
+    F.release(); fftwf_destroy_plan(r2cf);
+    fftwf_free(grid); for (auto a : out) fftwf_free(a); fftwf_free(ksp);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Label propagation on the kNN graph (weights p_{j|i}), as the GPU's label_propagation: synchronous sweeps in
+// which a random half of the nodes keep their label (avoids oscillation)
+// ---------------------------------------------------------------------------------------------
+static std::vector<int> label_propagation_cpu(const std::vector<int>& I, const std::vector<float>& Pw, int64_t N, int K, int sweeps, uint64_t seed) {
+    std::vector<int> a(N), b(N);
+    std::iota(a.begin(), a.end(), 0);
+    for (int s = 0; s < sweeps; s++) {
+        uint64_t sd = splitmix(seed + 0x1234 + s);
+        int64_t ch = 0;
+#pragma omp parallel reduction(+:ch)
+        {
+            std::vector<int> L(K); std::vector<float> W(K);
+#pragma omp for schedule(dynamic, 4096)
+            for (int64_t i = 0; i < N; i++) {
+                int cur = a[i];
+                if (splitmix(sd ^ (uint64_t)i) & 1) { b[i] = cur; continue; }
+                int m = 0;
+                for (int j = 0; j < K; j++) {
+                    float w = Pw[i * K + j];
+                    if (w == 0.f) continue;
+                    int l = a[I[i * K + j]];
+                    int t = 0; while (t < m && L[t] != l) t++;
+                    if (t == m) { L[m] = l; W[m] = w; m++; } else W[t] += w;
+                }
+                int best = cur; float bw = -1;
+                for (int t = 0; t < m; t++) if (W[t] > bw || (W[t] == bw && L[t] == cur)) { bw = W[t]; best = L[t]; }
+                b[i] = best;
+                ch += best != cur;
+            }
+        }
+        std::swap(a, b);
+        if (ch < N / 10000) break;
+    }
+    return a;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -820,7 +1169,6 @@ int main(int argc, char** argv) {
     }
     Opts o;
     parse_args(argc, argv, o);
-    if (o.sphere != 0 && o.project.empty()) { fprintf(stderr, "--sphere embedding needs the GPU build (fastsne); spherical models project on either\n"); return 1; }
     if (o.threads > 0) omp_set_num_threads(o.threads);
     if (o.nprobe < 0) o.nprobe = 32;
     if (o.refine < 0) o.refine = 1;
@@ -846,10 +1194,34 @@ int main(int argc, char** argv) {
     knn_cpu(Yp, N, DP, o, K, R);
     model.C = R.C; model.offs = R.offs;
 
+    // R.I / R.Dd: neighbours nearest first, squared distances
+    if (!o.knn_out.empty()) {
+        std::vector<int> Io((size_t)N * K);
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; i++) for (int j = 0; j < K; j++) Io[(size_t)R.perm[i] * K + j] = R.perm[R.I[(size_t)i * K + j]];
+        FILE* g = fopen(o.knn_out.c_str(), "wb");
+        if (!g) { fprintf(stderr, "cannot write %s\n", o.knn_out.c_str()); exit(1); }
+        wr(g, Io.data(), Io.size() * 4); fclose(g);
+        LOG("wrote kNN graph %s (%lld x %d)", o.knn_out.c_str(), (long long)N, K);
+    }
+    std::vector<float> rk, r1, idim;
+    if (!o.diag.empty()) {  // kNN radii and MLE intrinsic dimension from the K distances
+        rk.resize(N); r1.resize(N); idim.resize(N);
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            const float* d2 = &R.Dd[i * K];
+            rk[i] = d2[K - 1]; r1[i] = d2[0];
+            float lk = 0.5f * logf(std::max(d2[K - 1], 1e-20f)), s = 0;
+            for (int j = 0; j < K - 1; j++) s += lk - 0.5f * logf(std::max(d2[j], 1e-20f));
+            idim[i] = s > 0 ? (K - 2) / s : 100.f;
+        }
+    }
+
     // affinities, then rows re-sorted by neighbour index (memory order for the attraction loop, sorted lists
     // for the overlap measure)
     std::vector<float>& Pw = R.Dd;
-    std::vector<float> share(o.dedup > 0 ? N : 0);
+    const bool need_share = o.dedup > 0 || !o.diag.empty();
+    std::vector<float> share(need_share ? N : 0);
 #pragma omp parallel
     {
         std::vector<std::pair<int, float>> row(K);
@@ -863,8 +1235,30 @@ int main(int argc, char** argv) {
     }
     LOG("affinities done (perplexity %.1f%s)", o.perplexity, o.uniform ? ", uniform" : "");
 
-    std::vector<float> mass;
-    if (o.dedup > 0) {
+    // masses, in the GPU build's order: --shrink, then --dedup (multiplied in), then --mass-file (replaces both)
+    std::vector<float> mass, mass_out;
+    std::vector<int> groups;
+    if (o.shrink > 0 || !o.groups_out.empty()) {
+        groups = label_propagation_cpu(R.I, Pw, N, K, o.lp_sweeps, o.seed);
+        std::vector<int> cnt(N, 0);
+        for (auto g : groups) cnt[g]++;
+        std::vector<int> sizes; for (auto c : cnt) if (c) sizes.push_back(c);
+        std::sort(sizes.rbegin(), sizes.rend());
+        LOG("label propagation: %zu groups, largest %d %d %d %d %d", sizes.size(), sizes[0], sizes.size() > 1 ? sizes[1] : 0,
+            sizes.size() > 2 ? sizes[2] : 0, sizes.size() > 3 ? sizes[3] : 0, sizes.size() > 4 ? sizes[4] : 0);
+        if (o.shrink > 0) {
+            double ref = o.shrink_ref > 0 ? o.shrink_ref : std::max(100.0, N * 1e-3);
+            mass.resize(N);
+            double ms = 0;
+            for (int64_t i = 0; i < N; i++) {
+                double c = cnt[groups[i]];
+                mass[i] = (float)std::max<double>(o.mass_min, c > ref ? pow(ref / c, o.shrink) : 1.0);
+                ms += mass[i];
+            }
+            LOG("shrink: groups above %.0f points get mass (ref/n)^%.2f, mean mass %.3f", ref, o.shrink, ms / N);
+        }
+    }
+    if (need_share) {
         // overlap of each point's neighbour set with those of its 8 strongest neighbours (sorted-list intersection)
 #pragma omp parallel
         {
@@ -885,6 +1279,8 @@ int main(int argc, char** argv) {
                 share[i] = sh / na;
             }
         }
+    }
+    if (o.dedup > 0) {
         std::vector<float> t(share);
         std::nth_element(t.begin(), t.begin() + N / 2, t.end());
         float med = std::max(t[N / 2], 1e-3f);
@@ -900,29 +1296,95 @@ int main(int argc, char** argv) {
             }
             std::swap(lm, lm2);
         }
-        mass.resize(N);
+        std::vector<float> m(N);
         double ms = 0; int64_t nsh = 0;
 #pragma omp parallel for reduction(+:ms,nsh) schedule(static)
-        for (int64_t i = 0; i < N; i++) { mass[i] = std::max(o.mass_min, expf(lm[i])); ms += mass[i]; nsh += mass[i] < 0.5f; }
+        for (int64_t i = 0; i < N; i++) { m[i] = std::max(o.mass_min, expf(lm[i])); ms += m[i]; nsh += m[i] < 0.5f; }
+        if (!mass.empty()) for (int64_t i = 0; i < N; i++) m[i] = std::max(o.mass_min, m[i] * mass[i]);   // with --shrink
+        mass = m; mass_out = m;
         LOG("dedup: mean mass %.3f, %.1f%% of points below 0.5", ms / N, 100.0 * nsh / N);
     }
+    if (!o.mass_file.empty()) {
+        std::vector<float> mi;
+        FILE* f = fopen(o.mass_file.c_str(), "r");
+        if (!f) { fprintf(stderr, "cannot open %s\n", o.mass_file.c_str()); exit(1); }
+        float v; while (fscanf(f, "%f", &v) == 1) mi.push_back(v); fclose(f);
+        if ((int64_t)mi.size() != N) { fprintf(stderr, "mass file has %zu values, need %lld\n", mi.size(), (long long)N); exit(1); }
+        mass.resize(N);
+        for (int64_t i = 0; i < N; i++) mass[i] = mi[R.perm[i]];
+    }
 
-    // init: first two PCs scaled to std 1e-4
+    // init: first two PCs scaled to std 1e-4 (plane), or the direction of the first three PCs (sphere)
     std::vector<F2> Y(N);
     double sd = 0;
     for (int64_t i = 0; i < N; i++) sd += (double)R.X[(size_t)i * DP] * R.X[(size_t)i * DP];
     sd = sqrt(sd / N);
     float sc = (float)(1e-4 / std::max(sd, 1e-12));
     for (int64_t i = 0; i < N; i++) Y[i] = {R.X[(size_t)i * DP] * sc, R.X[(size_t)i * DP + 1] * sc};
+    std::vector<F3> Y3;
+    if (o.sphere) {
+        if (o.sphere < 0) o.sphere = sqrtf((float)N) / 12.f;
+        Y3.resize(N);
+        for (int64_t i = 0; i < N; i++) {
+            const float* p = &R.X[(size_t)i * DP];
+            float x = p[0], y = p[1], z = p[2], r = sqrtf(x * x + y * y + z * z);
+            if (!(r > 0)) { x = 1; y = z = 0; r = 1; }
+            Y3[i] = {o.sphere * x / r, o.sphere * y / r, o.sphere * z / r};
+        }
+    }
     if (!o.save_model.empty()) model.X = R.X;
     std::vector<float>().swap(R.X);
 
     double t_opt = now();
-    run_tsne_cpu(Y, N, K, R.I, Pw, mass, o);
+    if (!o.fixed_y.empty()) {
+        // positions from an existing map, matched by id (x, y; or lon, lat with --sphere)
+        std::unordered_map<std::string, F2> pos;
+        FILE* f = fopen(o.fixed_y.c_str(), "r");
+        if (!f) { fprintf(stderr, "cannot open %s\n", o.fixed_y.c_str()); exit(1); }
+        char line[4096];
+        while (fgets(line, sizeof line, f)) {
+            char* t1 = strchr(line, '\t'); if (!t1) continue;
+            *t1 = 0; float a, b;
+            if (sscanf(t1 + 1, "%f\t%f", &a, &b) == 2) pos[line] = {a, b};
+        }
+        fclose(f);
+        int64_t miss = 0;
+        for (int64_t i = 0; i < N; i++) {
+            int64_t r = R.perm[i];
+            auto it = pos.find(std::string(d.ids.data() + d.idoff[r], d.idoff[r + 1] - d.idoff[r]));
+            if (it == pos.end()) { miss++; Y[i] = {NAN, NAN}; } else Y[i] = it->second;
+        }
+        if (miss) { fprintf(stderr, "%lld of %lld input rows have no position in %s\n", (long long)miss, (long long)N, o.fixed_y.c_str()); exit(1); }
+        LOG("positions from %s", o.fixed_y.c_str());
+    } else if (o.sphere) {
+        AnchorsCPU an;
+        if (!o.anchor_file.empty()) {
+            std::vector<int> v;
+            FILE* f = fopen(o.anchor_file.c_str(), "r");
+            if (!f) { fprintf(stderr, "cannot open %s\n", o.anchor_file.c_str()); exit(1); }
+            int x; while (fscanf(f, "%d", &x) == 1) v.push_back(x); fclose(f);
+            if (v.size() % N) { fprintf(stderr, "anchor file has %zu values, not a multiple of %lld rows\n", v.size(), (long long)N); exit(1); }
+            an.nr = (int)(v.size() / N);
+            if ((int)o.anchor_w.size() != an.nr) { fprintf(stderr, "--anchor needs %d weights (one per rank column)\n", an.nr); exit(1); }
+            an.lab.resize((size_t)an.nr * N); an.offs.resize(an.nr); an.w = o.anchor_w;
+            for (int r = 0; r < an.nr; r++) {
+                int mx = -1;
+                for (int64_t i = 0; i < N; i++) { an.lab[(size_t)r * N + i] = v[(size_t)R.perm[i] * an.nr + r]; mx = std::max(mx, an.lab[(size_t)r * N + i]); }
+                an.offs[r] = an.total; an.total += mx + 1;
+            }
+            LOG("anchors: %d ranks, %d groups", an.nr, an.total);
+        }
+        run_tsne_sphere_cpu(Y3, N, K, R.I, Pw, mass, o, an);
+        for (int64_t i = 0; i < N; i++)  // lon, lat in degrees
+            Y[i] = {atan2f(Y3[i].y, Y3[i].x) * 57.29578f, asinf(fmaxf(-1.f, fminf(1.f, Y3[i].z / o.sphere))) * 57.29578f};
+    } else {
+        run_tsne_cpu(Y, N, K, R.I, Pw, mass, o);
+    }
     LOG("optimisation done in %.1fs", now() - t_opt);
 
     if (!o.save_model.empty()) {
         model.N = N; model.D = d.D; model.DP = DP; model.nc = R.nc; model.mode = mode;
+        model.R = o.sphere;
         model.Y.resize((size_t)N * 2);
         for (int64_t i = 0; i < N; i++) { model.Y[2 * i] = Y[i].x; model.Y[2 * i + 1] = Y[i].y; }
         save_model(o.save_model, model);
@@ -934,12 +1396,38 @@ int main(int argc, char** argv) {
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
     std::vector<char> buf(1 << 20);
     setvbuf(f, buf.data(), _IOFBF, buf.size());
-    fputs("id\tx\ty\n", f);
+    fputs(o.sphere ? "id\tlon\tlat\n" : "id\tx\ty\n", f);
     for (int64_t i = 0; i < N; i++) {
         fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], f);
         fprintf(f, "\t%.4f\t%.4f\n", Yo[i].x, Yo[i].y);
     }
     fclose(f);
     LOG("wrote %s", o.out.c_str());
+    if (!o.diag.empty()) {
+        FILE* g = fopen(o.diag.c_str(), "w");
+        if (!g) { fprintf(stderr, "cannot write %s\n", o.diag.c_str()); exit(1); }
+        std::vector<float> a(N), b(N), mm(N, 1.f), id2(N), sh2(N);
+        for (int64_t i = 0; i < N; i++) { int64_t r = R.perm[i]; a[r] = sqrtf(rk[i]); b[r] = sqrtf(r1[i]); id2[r] = idim[i]; sh2[r] = share[i]; }
+        if (!mass_out.empty()) for (int64_t i = 0; i < N; i++) mm[R.perm[i]] = mass_out[i];
+        fputs("id\trk\tr1\tlen_est\tmass\tidim\tshare\n", g);
+        for (int64_t i = 0; i < N; i++) {
+            fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], g);
+            fprintf(g, "\t%.4g\t%.4g\t%.0f\t%.3g\t%.3g\t%.3g\n", a[i], b[i], d.len_est[i], mm[i], id2[i], sh2[i]);
+        }
+        fclose(g);
+    }
+    if (!o.groups_out.empty()) {
+        FILE* g = fopen(o.groups_out.c_str(), "w");
+        if (!g) { fprintf(stderr, "cannot write %s\n", o.groups_out.c_str()); exit(1); }
+        std::vector<int> go(N);
+        for (int64_t i = 0; i < N; i++) go[R.perm[i]] = R.perm[groups[i]];
+        fputs("id\tgroup\n", g);
+        for (int64_t i = 0; i < N; i++) {
+            fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], g);
+            fprintf(g, "\tg%d\n", go[i]);
+        }
+        fclose(g);
+        LOG("wrote %s", o.groups_out.c_str());
+    }
     return 0;
 }
