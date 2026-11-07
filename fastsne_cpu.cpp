@@ -103,18 +103,30 @@ static std::vector<float> transform_pca_cpu(Data& d, const Opts& o, int DP, int 
     int64_t stride = std::max<int64_t>(1, N / std::max<int64_t>(1, o.pca_sample));
     std::vector<double> C((size_t)D * D, 0);
     int64_t ns = 0;
+    // blocks of 64 sampled rows: each row of the (upper) covariance triangle stays in L1 while the block's rows
+    // stream past it, instead of the whole D x D triangle streaming from memory once per row (memory bound: at
+    // D = 1024 one row at a time took 300 s for 905k rows on 16 threads)
+    const int RB = 64;
+    const int64_t nsamp = (N + stride - 1) / stride, nblk = (nsamp + RB - 1) / RB;
 #pragma omp parallel
     {
         std::vector<double> loc((size_t)D * D, 0);
-        std::vector<double> xc(D);
+        std::vector<double> xb((size_t)RB * D);
         int64_t nl = 0;
-#pragma omp for schedule(static) nowait
-        for (int64_t i = 0; i < N; i += stride) {
-            size_t c = std::upper_bound(d.cstart.begin(), d.cstart.end(), i) - d.cstart.begin() - 1;
-            const float* x = d.chunks[c].data() + (i - d.cstart[c]) * D;
-            for (int j = 0; j < D; j++) xc[j] = x[j] - mu[j];
-            for (int a = 0; a < D; a++) { double va = xc[a]; double* row = loc.data() + (size_t)a * D; for (int b = a; b < D; b++) row[b] += va * xc[b]; }
-            nl++;
+#pragma omp for schedule(dynamic, 4) nowait
+        for (int64_t blk = 0; blk < nblk; blk++) {
+            int nb = (int)std::min<int64_t>(RB, nsamp - blk * RB);
+            for (int r = 0; r < nb; r++) {
+                int64_t i = (blk * RB + r) * stride;
+                size_t c = std::upper_bound(d.cstart.begin(), d.cstart.end(), i) - d.cstart.begin() - 1;
+                const float* x = d.chunks[c].data() + (i - d.cstart[c]) * D;
+                for (int j = 0; j < D; j++) xb[(size_t)r * D + j] = x[j] - mu[j];
+            }
+            for (int a = 0; a < D; a++) {
+                double* row = loc.data() + (size_t)a * D;
+                for (int r = 0; r < nb; r++) { const double* xr = xb.data() + (size_t)r * D; double va = xr[a]; for (int b = a; b < D; b++) row[b] += va * xr[b]; }
+            }
+            nl += nb;
         }
 #pragma omp critical
         { for (size_t j = 0; j < C.size(); j++) C[j] += loc[j]; ns += nl; }

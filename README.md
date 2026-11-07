@@ -144,7 +144,7 @@ The model file is about 136 B per reference point (32-d PCA + 2-d position), i.e
 
 ## Spherical maps (`--sphere`)
 
-`--sphere R` embeds on a sphere of radius R instead of a plane (GPU build): the same cost with the Cauchy kernel on
+`--sphere R` embeds on a sphere of radius R instead of a plane (both builds): the same cost with the Cauchy kernel on
 chord distance, repulsion from one 3D FFT over the sphere's bounding cube with cubic interpolation, gradients
 projected onto the tangent plane. Output is `id lon lat` in degrees. On 905,628 SILVA SSU sequences (5-mer counts,
 `--transform sqrt --pca 128`) R 35 with `--h 0.28` keeps the repulsive force error near 1% on the default 512^3
@@ -165,6 +165,12 @@ grid and takes about 50 s on a GV100; at h 0.5 the error is about 8%.
   amplicons (V4, V9, ...) with references cut to the amplicon region: on held-out SILVA sequences a 253 bp V4
   region lands within one unit of its full-length position 77% of the time.
 - `--pca` goes up to 128 on the GPU; `--write-knn FILE` writes the kNN graph (N x k int32 row numbers, input order).
+- CPU build (`fastsne_cpu`): same options, defaults and model files; on a 50k-row SILVA slice the CPU and GPU maps
+  have the same kNN preservation, label agreement, KL and anchor pull (differences at the level of a change of
+  seed). The 3D FFT dominates: the default 512^3 grid (any R above about sqrt(N)/12 at N = 1M, or R 35 with
+  h 0.28) needs 3.8 GB of RAM and about 0.8 s per iteration on 16 threads of an i7-10700K (8 cores, AVX2), so
+  1000 iterations take about 15 min against under a minute on a GV100; a 50k-point map (R 18.7, a 162^3 grid)
+  takes about TIME50K.
 
 ## How it works
 
