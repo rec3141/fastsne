@@ -165,12 +165,13 @@ grid and takes about 50 s on a GV100; at h 0.5 the error is about 8%.
   amplicons (V4, V9, ...) with references cut to the amplicon region: on held-out SILVA sequences a 253 bp V4
   region lands within one unit of its full-length position 77% of the time.
 - `--pca` goes up to 128 on the GPU; `--write-knn FILE` writes the kNN graph (N x k int32 row numbers, input order).
-- CPU build (`fastsne_cpu`): same options, defaults and model files; on a 50k-row SILVA slice the CPU and GPU maps
-  have the same kNN preservation, label agreement, KL and anchor pull (differences at the level of a change of
-  seed). The 3D FFT dominates: the default 512^3 grid (any R above about sqrt(N)/12 at N = 1M, or R 35 with
-  h 0.28) needs 3.8 GB of RAM and about 0.8 s per iteration on 16 threads of an i7-10700K (8 cores, AVX2), so
-  1000 iterations take about 15 min against under a minute on a GV100; a 50k-point map (R 18.7, a 162^3 grid)
-  takes about TIME50K.
+- CPU build (`fastsne_cpu`): same options, defaults and model files. On a 50k-row SILVA slice the CPU and GPU
+  maps have the same kNN preservation, label agreement, KL and anchor pull (differences at the level of a change
+  of seed), and a model saved by either places held-out sequences identically through either build's
+  `--project`. The 3D FFT dominates: the default 512^3 grid (R above about 64 at h 0.5, or R 35 with h 0.28)
+  needs 3.8 GB of RAM and about 1 s per iteration on 16 threads of an i7-10700K (8 cores, AVX2, shared with
+  another job): all 905,628 SILVA sequences (`--sphere auto`, R 79) took 18 min, 17 of them optimisation, against
+  under a minute on a GV100. A 50k slice (R 18.7, 162^3 grid) takes about 45 s (37 s optimisation; GPU 12 s).
 
 ## How it works
 
