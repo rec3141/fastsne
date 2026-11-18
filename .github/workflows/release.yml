@@ -113,3 +113,12 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" --title "$GITHUB_REF_NAME" --notes "$notes"
           fi
+      - name: Rebuild the danaSeq images
+        # danaSeq installs the latest fastsne release; this fires its container builds.
+        # Needs DANASEQ_DISPATCH_TOKEN, a token with contents write on rec3141/danaSeq.
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.DANASEQ_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "DANASEQ_DISPATCH_TOKEN not set; danaSeq not rebuilt"; exit 0; fi
+          gh api repos/rec3141/danaSeq/dispatches -f event_type=fastsne-release
