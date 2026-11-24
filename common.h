@@ -50,9 +50,10 @@ struct Opts {
     float ee = 12.f;
     float exag = 1.f;           // exaggeration after the early phase
     float lr = -1;              // default N/ee
-    float h = -1;               // grid spacing in embedding units (0.25; sphere 0.5)
-    int max_grid = -1;          // max padded FFT size (8192; sphere 512, per axis)
+    float h = -1;               // grid spacing in embedding units (0.25; sphere and 3D 0.5)
+    int max_grid = -1;          // max padded FFT size (8192; sphere 512, 3D 1024, per axis)
     float sphere = 0;           // embed on a sphere of this radius (0 = plane, -1 = auto)
+    int dims = 2;               // embedding dimensions: 2 (plane) or 3 (free 3D)
     double sample = 1.0;        // keep each row with this probability
     uint64_t seed = 1;
     int threads = 0;
@@ -438,6 +439,14 @@ static int fft_size(int need) {
     return best;
 }
 
+static int fft_size_below(int n) {
+    // largest 2^a 3^b <= n
+    int best = 1;
+    for (int64_t p2 = 1; p2 <= n; p2 *= 2)
+        for (int64_t v = p2; v <= n; v *= 3) if (v > best) best = (int)v;
+    return best;
+}
+
 
 struct Model {
     int64_t N = 0; int D = 0, DP = 0, nc = 0, mode = 0;
@@ -497,6 +506,11 @@ static void usage() {
         "  --sphere R|auto    embed on a sphere of radius R (auto = sqrt(N)/12); output id lon lat (degrees).\n"
         "                     Defaults change to --h 0.5 --max-grid 512 (padded 3D FFT per axis; a 512^3 grid\n"
         "                     needs 3.8 GB of RAM on the CPU, 7.5 GB on the GPU)\n"
+        "  --dims 3           free 3D embedding; output id x y z. Defaults change to --h 0.5 --max-grid 1024 (padded\n"
+        "                     3D FFT per axis, fixed for the run; h grows with the extent once the map outgrows the\n"
+        "                     grid). Memory per padded cell: 28 bytes on the CPU (30 GB at 1024^3, 101 GB at 1536^3),\n"
+        "                     56 on the GPU (7.5 GB at 512^3). Not with --sphere, --anchor-file, --fixed-y,\n"
+        "                     --save-model or --project\n"
         "  --anchor-file F --anchor W1,W2,..  sphere: pull each point toward the centroid of its group at each rank\n"
         "                     (F: whitespace-separated group ids, one row per input row, one column per rank, -1 = none)\n"
         "  --shrink G         shrink big homogeneous groups: kNN label-propagation groups with n > ref points\n"
@@ -546,6 +560,7 @@ static void parse_args(int argc, char** argv, Opts& o) {
         else if (a == "--h") o.h = atof(nx().c_str());
         else if (a == "--max-grid") o.max_grid = atoi(nx().c_str());
         else if (a == "--sphere") { std::string v = nx(); o.sphere = v == "auto" ? -1.f : (float)atof(v.c_str()); if (o.sphere == 0) usage(); }
+        else if (a == "--dims") { o.dims = atoi(nx().c_str()); if (o.dims != 2 && o.dims != 3) usage(); }
         else if (a == "--sample") o.sample = atof(nx().c_str());
         else if (a == "--seed") o.seed = strtoull(nx().c_str(), 0, 10);
         else if (a == "--threads") o.threads = atoi(nx().c_str());
@@ -576,9 +591,14 @@ static void parse_args(int argc, char** argv, Opts& o) {
         else usage();
     }
     if (o.inputs.empty()) usage();
+    if (o.dims == 3) {
+        const char* bad = o.sphere != 0 ? "--sphere" : !o.anchor_file.empty() ? "--anchor-file" : !o.fixed_y.empty() ? "--fixed-y"
+                        : !o.save_model.empty() ? "--save-model" : !o.project.empty() ? "--project" : nullptr;
+        if (bad) { fprintf(stderr, "--dims 3 does not combine with %s\n", bad); exit(1); }
+    }
     if (o.perplexity <= 0) o.perplexity = o.k / 3.f;
-    if (o.h <= 0) o.h = o.sphere != 0 ? 0.5f : 0.25f;
-    if (o.max_grid <= 0) o.max_grid = o.sphere != 0 ? 512 : 8192;
+    if (o.h <= 0) o.h = o.sphere != 0 || o.dims == 3 ? 0.5f : 0.25f;
+    if (o.max_grid <= 0) o.max_grid = o.sphere != 0 ? 512 : o.dims == 3 ? 1024 : 8192;
     if (o.nprobe > 0) o.nprobe = std::max(1, std::min(o.nprobe, 64));
 }
 

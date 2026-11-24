@@ -173,6 +173,40 @@ grid and takes about 50 s on a GV100; at h 0.5 the error is about 8%.
   another job): all 905,628 SILVA sequences (`--sphere auto`, R 79) took 18 min, 17 of them optimisation, against
   under a minute on a GV100. A 50k slice (R 18.7, 162^3 grid) takes about 45 s (37 s optimisation; GPU 12 s).
 
+## 3D maps (`--dims 3`)
+
+`--dims 3` embeds in free 3D (both builds; output `id x y z`). Repulsion uses the sphere's machinery (one 3D FFT,
+cubic splat and gather) on a padded grid that is fixed for the run and centred on the points each iteration. Once
+the map outgrows the grid, the spacing h grows with the extent in 1.02 steps, and the kernel spectra are recomputed
+only when h changes. Defaults: `--h 0.5 --max-grid 1024`. The GPU build shrinks the grid to what fits in free GPU
+memory and logs it. Not with `--sphere`, `--anchor-file`, `--fixed-y`, `--save-model` or `--project`.
+
+```
+./fastsne_cpu -i refs.fsb -o map3d.tsv --transform sqrt --pca 128 --dims 3 --max-grid 1536
+```
+
+**Resolution is the limit.** A 3D map is large and keeps expanding: on GTDB 10 kb fragments the extent is about
+240 at 1,250 iterations for 0.2M and 1M points alike, and 540 after 10,250 iterations (0.2M). The bulk of the map
+grows, not just outliers. h therefore grows with it, and once h is well above the kernel's width of 1, the grid
+cannot resolve the repulsion inside clusters. The measured error of the repulsive force is 3% at h 0.5, 36% at
+h 1, and above 90% from h 1.8. The map degrades gradually, not catastrophically. 200k fragments, 1,250 iterations,
+10-NN recall of the input kNN:
+
+| | h at the end | recall | genus purity of 10 map neighbours |
+|---|---|---|---|
+| 2D (h 0.25) | 0.25 | 0.347 | 0.441 |
+| 3D, 128^3 grid | 3.2 | 0.286 | 0.404 |
+| 3D, 256^3 | 1.8 | 0.333 | 0.439 |
+| 3D, 512^3 | 0.96 | 0.363 | 0.453 |
+| 3D, 648^3 (GPU) | 0.77 | 0.369 | 0.455 |
+| 3D, 512^3, 10,250 iterations | 2.2 | 0.346 | 0.447 |
+
+On 1M fragments (1,250 iterations) 3D at 648^3 gives recall 0.353 and genus purity 0.657, against 0.301 and
+0.621 for 2D. So use the largest grid the memory and time allow. The CPU needs 28 bytes per padded cell (30 GB at
+1024^3, 101 GB at 1536^3, 240 GB at 2048^3), and the FFT dominates the time: on 12 threads of an i7-10700K, 512^3
+takes about 1 s per iteration. The GPU needs 56 bytes per cell; a 648^3 grid fits a 32 GB GV100 alongside 1M
+points and takes 0.1 s per iteration.
+
 ## How it works
 
 1. CLR transform (pseudocount = half the smallest nonzero frequency of the row, about 0.5 counts), then PCA to 32 dims.

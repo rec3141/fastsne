@@ -750,6 +750,40 @@ struct PrunedFFT3 {
     void release() { for (fftwf_plan q : {fx, fy, fz, ix, iy, iz}) if (q) fftwf_destroy_plan(q); }
 };
 
+// Spectra of the Cauchy kernel w = 1/(1+r^2) (Re, scaled by 1/P^3) and of its gradient -2 r w^2 (Im, per axis) on
+// the padded P^3 grid of spacing h. grid is the in-place r2c work array (overwritten); ksp holds 4 * PC floats.
+static void kernel_spectra3(int P, float h, fftwf_complex* grid, fftwf_plan r2cf, float* ksp) {
+    const int Pc = P / 2 + 1, Ps = 2 * Pc;
+    const size_t PC = (size_t)P * P * Pc;
+    float* g = (float*)grid;
+    double kept = 0, dropped = 0;
+    const float sc = 1.f / ((float)P * P * P);
+    for (int k = 0; k < 4; k++) {
+#pragma omp parallel for schedule(static)
+        for (int l = 0; l < P; l++)
+            for (int r = 0; r < P; r++) {
+                int dz = l < P / 2 ? l : l - P, dy = r < P / 2 ? r : r - P;
+                float* row = g + ((size_t)l * P + r) * Ps;
+                for (int c = 0; c < P; c++) {
+                    int dx = c < P / 2 ? c : c - P;
+                    float x = dx * h, y = dy * h, z = dz * h, w = 1.f / (1.f + x * x + y * y + z * z);
+                    row[c] = k == 0 ? w : k == 1 ? (c == P / 2 ? 0.f : -2.f * x * w * w)
+                           : k == 2 ? (r == P / 2 ? 0.f : -2.f * y * w * w) : (l == P / 2 ? 0.f : -2.f * z * w * w);
+                }
+            }
+        fftwf_execute(r2cf);   // the kernels fill the whole grid: full transform
+        double kk = 0, kd = 0;
+#pragma omp parallel for reduction(max:kk,kd) schedule(static)
+        for (size_t t = 0; t < PC; t++) {
+            float re = grid[t][0], im = grid[t][1];
+            ksp[k * PC + t] = (k == 0 ? re : im) * sc;
+            kk = std::max(kk, (double)fabsf(k == 0 ? re : im)); kd = std::max(kd, (double)fabsf(k == 0 ? im : re));
+        }
+        kept = std::max(kept, kk); dropped = std::max(dropped, kd);
+    }
+    if (dropped > 1e-4 * kept) LOG("warning: kernel spectra not real/imaginary (%.2g of max)", dropped / kept);
+}
+
 static void run_tsne_sphere_cpu(std::vector<F3>& Y, int64_t N, int K, const std::vector<int>& I, const std::vector<float>& Pw,
                                 const std::vector<float>& mass, const Opts& o, const AnchorsCPU& an) {
     const float R = o.sphere;
@@ -781,35 +815,7 @@ static void run_tsne_sphere_cpu(std::vector<F3>& Y, int64_t N, int K, const std:
 #pragma omp parallel for schedule(static)
         for (int l = 0; l < P; l++) memset(a + (size_t)l * P * Pc, 0, (size_t)P * Pc * 8);
     };
-    {
-        float* g = (float*)grid;
-        double kept = 0, dropped = 0;
-        const float sc = 1.f / ((float)P * P * P);
-        for (int k = 0; k < 4; k++) {
-#pragma omp parallel for schedule(static)
-            for (int l = 0; l < P; l++)
-                for (int r = 0; r < P; r++) {
-                    int dz = l < P / 2 ? l : l - P, dy = r < P / 2 ? r : r - P;
-                    float* row = g + ((size_t)l * P + r) * Ps;
-                    for (int c = 0; c < P; c++) {
-                        int dx = c < P / 2 ? c : c - P;
-                        float x = dx * h, y = dy * h, z = dz * h, w = 1.f / (1.f + x * x + y * y + z * z);
-                        row[c] = k == 0 ? w : k == 1 ? (c == P / 2 ? 0.f : -2.f * x * w * w)
-                               : k == 2 ? (r == P / 2 ? 0.f : -2.f * y * w * w) : (l == P / 2 ? 0.f : -2.f * z * w * w);
-                    }
-                }
-            fftwf_execute(r2cf);   // the kernels fill the whole grid: full transform
-            double kk = 0, kd = 0;
-#pragma omp parallel for reduction(max:kk,kd) schedule(static)
-            for (size_t t = 0; t < PC; t++) {
-                float re = grid[t][0], im = grid[t][1];
-                ksp[k * PC + t] = (k == 0 ? re : im) * sc;
-                kk = std::max(kk, (double)fabsf(k == 0 ? re : im)); kd = std::max(kd, (double)fabsf(k == 0 ? im : re));
-            }
-            kept = std::max(kept, kk); dropped = std::max(dropped, kd);
-        }
-        if (dropped > 1e-4 * kept) LOG("warning: kernel spectra not real/imaginary (%.2g of max)", dropped / kept);
-    }
+    kernel_spectra3(P, h, grid, r2cf, ksp);
     LOG("sphere R %.1f: grid %d^3 (padded %d^3), h %.3f, %.1f GB", R, G, P, h, PC * 56 / 1e9);
 
     std::vector<F3> U(N, {0, 0, 0}), Gn(N, {1, 1, 1}), A(N), Gp(N);
@@ -980,6 +986,226 @@ static void run_tsne_sphere_cpu(std::vector<F3>& Y, int64_t N, int K, const std:
     }
     LOG("optimisation time: splat %.1fs, FFT %.1fs, gather %.1fs, attraction%s %.1fs, update %.1fs", t_spl, t_fft, t_gat,
         an.nr ? " + anchors" : "", t_att, t_upd);
+    F.release(); fftwf_destroy_plan(r2cf);
+    fftwf_free(grid); for (auto a : out) fftwf_free(a); fftwf_free(ksp);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Free 3D embedding (--dims 3): the sphere's 3D FFT field (cubic Lagrange splat / gather, pruned in-place
+// transforms, real / imaginary kernel spectra, 28 bytes per padded cell) on a plain 3D map. The padded grid P^3 is
+// fixed for the run (planned once); each iteration centres it on the points' bounding box, and once the map
+// outgrows it the spacing h grows with the extent in 1.02 steps (as in 2D), the kernel spectra being recomputed
+// only when h changes. While the points still sit in a few cells (the first iterations), each thread splats into
+// its own copy of the occupied box instead of contending on atomics.
+// ---------------------------------------------------------------------------------------------
+static void run_tsne_3d_cpu(std::vector<F3>& Y, int64_t N, int K, const std::vector<int>& I, const std::vector<float>& Pw,
+                            const std::vector<float>& mass, const Opts& o) {
+    std::vector<int64_t> roff; std::vector<int> rsrc; std::vector<float> rp;
+    build_reverse(N, K, I, Pw, roff, rsrc, rp);
+    const bool hasm = !mass.empty();
+    const int nthr = omp_get_max_threads();
+    const int G = fft_size_below(std::max(32, o.max_grid / 2));
+    const int P = 2 * G, Pc = P / 2 + 1, Ps = 2 * Pc;
+    const size_t PC = (size_t)P * P * Pc;
+    fftwf_complex* grid = fftwf_alloc_complex(PC);
+    fftwf_complex* out[4];
+    for (auto& a : out) a = fftwf_alloc_complex(PC);
+    float* ksp = fftwf_alloc_real(4 * PC);
+    if (!grid || !out[0] || !out[1] || !out[2] || !out[3] || !ksp) { fprintf(stderr, "cannot allocate the %d^3 FFT grid\n", P); exit(1); }
+    fftwf_plan_with_nthreads(nthr);
+    double tp = now();
+    PrunedFFT3 F;
+    F.plan(P, G, grid, out[0], FFTW_MEASURE);
+    fftwf_plan r2cf = fftwf_plan_dft_r2c_3d(P, P, P, (float*)grid, grid, FFTW_ESTIMATE);
+    LOG("3D: grid %d^3 (padded %d^3), %.1f GB; FFT plans %.1fs", G, P, PC * 56 / 1e9, now() - tp);
+    auto zero = [&](fftwf_complex* a) {
+#pragma omp parallel for schedule(static)
+        for (int l = 0; l < P; l++) memset(a + (size_t)l * P * Pc, 0, (size_t)P * Pc * 8);
+    };
+
+    std::vector<F3> U(N, {0, 0, 0}), Gn(N, {1, 1, 1}), A(N), Gp(N);
+    std::vector<float> priv;
+    const float lr = o.lr > 0 ? o.lr : std::max(200.f, (float)N / o.ee);
+    const int total = o.ee_iters + o.iters;
+    float hcur = 0;
+    int nkern = 0;
+    double t_spl = 0, t_fft = 0, t_gat = 0, t_att = 0, t_upd = 0, t_ker = 0;
+    for (int it = 0; it < total; it++) {
+        bool ee = it < o.ee_iters;
+        float exag = ee ? o.ee : o.exag, mom = ee ? 0.5f : 0.8f;
+        double t0 = now();
+        float xmn = 1e30f, ymn = 1e30f, zmn = 1e30f, xmx = -1e30f, ymx = -1e30f, zmx = -1e30f;
+#pragma omp parallel for reduction(min:xmn,ymn,zmn) reduction(max:xmx,ymx,zmx) schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            xmn = std::min(xmn, Y[i].x); xmx = std::max(xmx, Y[i].x); ymn = std::min(ymn, Y[i].y); ymx = std::max(ymx, Y[i].y);
+            zmn = std::min(zmn, Y[i].z); zmx = std::max(zmx, Y[i].z);
+        }
+        float ext = std::max(xmx - xmn, std::max(ymx - ymn, zmx - zmn));
+        // spacing: o.h while the map fits, else extent / (G - 6) rounded up to a power of 1.02 times o.h; kept when
+        // the map shrinks by less than 10% of h, so the kernels are not recomputed back and forth
+        float h = o.h;
+        if (ext / o.h + 6 > G) h = o.h * powf(1.02f, ceilf(logf(ext / (G - 6) / o.h) / logf(1.02f)));
+        if (hcur > 0 && h < hcur && h > hcur / 1.1f && ext / hcur + 6 <= G) h = hcur;
+        if (h != hcur) {
+            double tk = now();
+            kernel_spectra3(P, h, grid, r2cf, ksp);
+            hcur = h; nkern++;
+            t_ker += now() - tk;
+            t0 += now() - tk;   // kernel time is logged separately
+        }
+        const float ih = 1.f / h;
+        const float x0 = 0.5f * (xmn + xmx) - 0.5f * G * h, y0 = 0.5f * (ymn + ymx) - 0.5f * G * h, z0 = 0.5f * (zmn + zmx) - 0.5f * G * h;
+        zero(grid);
+        float* g = (float*)grid;
+        // occupied box of cells (stencil -1 .. +2 around each point's cell)
+        const int bx0 = (int)floorf((xmn - x0) * ih) - 1, by0 = (int)floorf((ymn - y0) * ih) - 1, bz0 = (int)floorf((zmn - z0) * ih) - 1;
+        const int BX = (int)floorf((xmx - x0) * ih) + 3 - bx0, BY = (int)floorf((ymx - y0) * ih) + 3 - by0, BZ = (int)floorf((zmx - z0) * ih) + 3 - bz0;
+        const size_t BV = (size_t)BX * BY * BZ;
+        if (BV * nthr <= ((size_t)64 << 20)) {
+            priv.resize(BV * nthr);
+#pragma omp parallel
+            {
+                float* pg = priv.data() + BV * omp_get_thread_num();
+                memset(pg, 0, BV * 4);
+#pragma omp for schedule(static)
+                for (int64_t i = 0; i < N; i++) {
+                    F3 y = Y[i];
+                    float u = (y.x - x0) * ih, v = (y.y - y0) * ih, s = (y.z - z0) * ih;
+                    int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+                    float wx[4], wy[4], wz[4];
+                    lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+                    float m = hasm ? mass[i] : 1.f;
+                    size_t b = ((size_t)(iz - 1 - bz0) * BY + (iy - 1 - by0)) * BX + (ix - 1 - bx0);
+                    for (int c = 0; c < 4; c++)
+                        for (int r = 0; r < 4; r++) {
+                            float wzy = m * wz[c] * wy[r];
+                            float* row = pg + b + ((size_t)c * BY + r) * BX;
+                            for (int q = 0; q < 4; q++) row[q] += wzy * wx[q];
+                        }
+                }
+#pragma omp for schedule(static)
+                for (size_t c = 0; c < BV; c++) {
+                    float sum = 0;
+                    for (int t = 0; t < nthr; t++) sum += priv[BV * t + c];
+                    size_t qx = c % BX, qy = (c / BX) % BY, qz = c / ((size_t)BX * BY);
+                    g[((qz + bz0) * P + (qy + by0)) * Ps + qx + bx0] = sum;
+                }
+            }
+        } else {
+            if (!priv.empty()) std::vector<float>().swap(priv);
+#pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < N; i++) {
+                F3 y = Y[i];
+                float u = (y.x - x0) * ih, v = (y.y - y0) * ih, s = (y.z - z0) * ih;
+                int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+                float wx[4], wy[4], wz[4];
+                lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+                float m = hasm ? mass[i] : 1.f;
+                size_t b = ((size_t)(iz - 1) * P + (iy - 1)) * Ps + (ix - 1);
+                for (int c = 0; c < 4; c++)
+                    for (int r = 0; r < 4; r++) {
+                        float wzy = m * wz[c] * wy[r];
+                        float* row = g + b + ((size_t)c * P + r) * Ps;
+                        for (int q = 0; q < 4; q++) atomic_addf(row + q, wzy * wx[q]);
+                    }
+            }
+        }
+        double t1 = now();
+        F.forward(grid);
+#pragma omp parallel for schedule(static)
+        for (size_t t = 0; t < PC; t++) {
+            float sr = grid[t][0], si = grid[t][1], k0 = ksp[t];
+            out[0][t][0] = sr * k0; out[0][t][1] = si * k0;
+            for (int k = 1; k < 4; k++) { float kk = ksp[k * PC + t]; out[k][t][0] = -si * kk; out[k][t][1] = sr * kk; }
+        }
+        for (int k = 0; k < 4; k++) F.inverse(out[k]);
+        double t2 = now();
+        // gather phi and grad phi; Z = sum_i m_i (phi_i - m_i), the self-interaction taken as the exact w(0) = 1
+        const float* fo[4] = {(const float*)out[0], (const float*)out[1], (const float*)out[2], (const float*)out[3]};
+        double Z = 0;
+#pragma omp parallel for reduction(+:Z) schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            F3 y = Y[i];
+            float u = (y.x - x0) * ih, v = (y.y - y0) * ih, s = (y.z - z0) * ih;
+            int ix = (int)floorf(u), iy = (int)floorf(v), iz = (int)floorf(s);
+            float wx[4], wy[4], wz[4];
+            lagrange4(u - ix, wx); lagrange4(v - iy, wy); lagrange4(s - iz, wz);
+            size_t b = ((size_t)(iz - 1) * P + (iy - 1)) * Ps + (ix - 1);
+            float r4[4] = {0, 0, 0, 0};
+            for (int c = 0; c < 4; c++)
+                for (int rr = 0; rr < 4; rr++) {
+                    float wzy = wz[c] * wy[rr];
+                    const size_t o = b + ((size_t)c * P + rr) * Ps;
+                    for (int q = 0; q < 4; q++) {
+                        float w = wzy * wx[q];
+                        for (int k = 0; k < 4; k++) r4[k] += w * fo[k][o + q];
+                    }
+                }
+            float m = hasm ? mass[i] : 1.f;
+            Z += (double)m * (r4[0] - m);
+            Gp[i] = {r4[1], r4[2], r4[3]};
+        }
+        double t3 = now();
+#pragma omp parallel for schedule(dynamic, 4096)
+        for (int64_t i = 0; i < N; i++) {
+            F3 yi = Y[i]; float ax = 0, ay = 0, az = 0;
+            const int* nb = &I[i * K]; const float* pw = &Pw[i * K];
+            for (int j = 0; j < K; j++) {
+                float p = pw[j]; if (p == 0.f) continue;
+                F3 q = Y[nb[j]]; float dx = yi.x - q.x, dy = yi.y - q.y, dz = yi.z - q.z, f = p / (1.f + dx * dx + dy * dy + dz * dz);
+                ax += f * dx; ay += f * dy; az += f * dz;
+            }
+            for (int64_t e = roff[i]; e < roff[i + 1]; e++) {
+                F3 q = Y[rsrc[e]]; float dx = yi.x - q.x, dy = yi.y - q.y, dz = yi.z - q.z, f = rp[e] / (1.f + dx * dx + dy * dy + dz * dz);
+                ax += f * dx; ay += f * dy; az += f * dz;
+            }
+            A[i] = {ax, ay, az};
+        }
+        double t4 = now();
+        if (o.check_grad > 0 && (it == o.ee_iters - 1 || it == total - 1)) {
+            int nq = (int)std::min<int64_t>(o.check_grad, N);
+            std::mt19937 r2(7); std::vector<int> qs(nq); for (auto& q : qs) q = (int)(r2() % N);
+            double num = 0, den = 0, zsum = 0;
+            for (int q : qs) {
+                double z = 0, fx = 0, fy = 0, fz = 0;
+                const F3 yq = Y[q];
+#pragma omp parallel for reduction(+:z,fx,fy,fz) schedule(static)
+                for (int64_t j = 0; j < N; j++) {
+                    if (j == q) continue;
+                    float dx = yq.x - Y[j].x, dy = yq.y - Y[j].y, dz = yq.z - Y[j].z;
+                    float w = 1.f / (1.f + dx * dx + dy * dy + dz * dz), m = hasm ? mass[j] : 1.f;
+                    z += m * w; fx += m * w * w * dx; fy += m * w * w * dy; fz += m * w * w * dz;
+                }
+                double a[3] = {-0.5 * Gp[q].x, -0.5 * Gp[q].y, -0.5 * Gp[q].z}, ex[3] = {fx, fy, fz};
+                for (int c = 0; c < 3; c++) { num += (a[c] - ex[c]) * (a[c] - ex[c]); den += ex[c] * ex[c]; }
+                zsum += (hasm ? mass[q] : 1.f) * z;
+            }
+            LOG("grad check it %d: rel. error of repulsive force %.4f, Z grid %.4g vs sampled exact %.4g (h=%.3f, P=%d)",
+                it, sqrt(num / den), Z, zsum / nq * N, h, P);
+        }
+        double tu = now();   // the check is left out of the timings
+#pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < N; i++) {
+            float m = hasm ? mass[i] : 1.f, rs = (float)(0.5 * m / Z);
+            F3 a = A[i], gp = Gp[i], u = U[i], gn = Gn[i];
+            float gv[3] = {exag * a.x + rs * gp.x, exag * a.y + rs * gp.y, exag * a.z + rs * gp.z};
+            float* uu = &u.x; float* gg = &gn.x; float* yy = &Y[i].x;
+            for (int c = 0; c < 3; c++) {
+                gg[c] = (std::signbit(gv[c]) != std::signbit(uu[c])) ? gg[c] + 0.2f : std::max(gg[c] * 0.8f, 0.01f);
+                uu[c] = mom * uu[c] - lr * gg[c] * gv[c];
+                yy[c] += uu[c];
+            }
+            U[i] = u; Gn[i] = gn;
+        }
+        if (it == o.ee_iters - 1) std::fill(U.begin(), U.end(), F3{0, 0, 0});
+        double t5 = now();
+        t_spl += t1 - t0; t_fft += t2 - t1; t_gat += t3 - t2; t_att += t4 - t3; t_upd += t5 - tu;
+        if (it % 100 == 0 || it == total - 1)
+            LOG("iter %4d  extent %8.2f  h %.3f  Z/N %.4g  (%.0f ms/iter: splat %.0f, fft %.0f, gather %.0f, attraction %.0f)", it, ext, h, Z / N,
+                1e3 * (t5 - tu + t4 - t0), 1e3 * (t1 - t0), 1e3 * (t2 - t1), 1e3 * (t3 - t2), 1e3 * (t4 - t3));
+    }
+    LOG("optimisation time: splat %.1fs, FFT %.1fs, gather %.1fs, attraction %.1fs, update %.1fs; kernels %d times, %.1fs",
+        t_spl, t_fft, t_gat, t_att, t_upd, nkern, t_ker);
     F.release(); fftwf_destroy_plan(r2cf);
     fftwf_free(grid); for (auto a : out) fftwf_free(a); fftwf_free(ksp);
 }
@@ -1326,7 +1552,8 @@ int main(int argc, char** argv) {
         for (int64_t i = 0; i < N; i++) mass[i] = mi[R.perm[i]];
     }
 
-    // init: first two PCs scaled to std 1e-4 (plane), or the direction of the first three PCs (sphere)
+    // init: first two PCs scaled to std 1e-4 (plane), the first three so scaled (3D), or the direction of the
+    // first three PCs (sphere)
     std::vector<F2> Y(N);
     double sd = 0;
     for (int64_t i = 0; i < N; i++) sd += (double)R.X[(size_t)i * DP] * R.X[(size_t)i * DP];
@@ -1334,7 +1561,10 @@ int main(int argc, char** argv) {
     float sc = (float)(1e-4 / std::max(sd, 1e-12));
     for (int64_t i = 0; i < N; i++) Y[i] = {R.X[(size_t)i * DP] * sc, R.X[(size_t)i * DP + 1] * sc};
     std::vector<F3> Y3;
-    if (o.sphere) {
+    if (o.dims == 3) {
+        Y3.resize(N);
+        for (int64_t i = 0; i < N; i++) { const float* p = &R.X[(size_t)i * DP]; Y3[i] = {p[0] * sc, p[1] * sc, p[2] * sc}; }
+    } else if (o.sphere) {
         if (o.sphere < 0) o.sphere = sqrtf((float)N) / 12.f;
         Y3.resize(N);
         for (int64_t i = 0; i < N; i++) {
@@ -1368,6 +1598,8 @@ int main(int argc, char** argv) {
         }
         if (miss) { fprintf(stderr, "%lld of %lld input rows have no position in %s\n", (long long)miss, (long long)N, o.fixed_y.c_str()); exit(1); }
         LOG("positions from %s", o.fixed_y.c_str());
+    } else if (o.dims == 3) {
+        run_tsne_3d_cpu(Y3, N, K, R.I, Pw, mass, o);
     } else if (o.sphere) {
         AnchorsCPU an;
         if (!o.anchor_file.empty()) {
@@ -1402,16 +1634,18 @@ int main(int argc, char** argv) {
         save_model(o.save_model, model);
         LOG("saved model %s", o.save_model.c_str());
     }
-    std::vector<F2> Yo(N);
-    for (int64_t i = 0; i < N; i++) Yo[R.perm[i]] = Y[i];
+    std::vector<F2> Yo(o.dims == 3 ? 0 : N);
+    std::vector<F3> Yo3(o.dims == 3 ? N : 0);
+    for (int64_t i = 0; i < N; i++) if (o.dims == 3) Yo3[R.perm[i]] = Y3[i]; else Yo[R.perm[i]] = Y[i];
     FILE* f = fopen(o.out.c_str(), "w");
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
     std::vector<char> buf(1 << 20);
     setvbuf(f, buf.data(), _IOFBF, buf.size());
-    fputs(o.sphere ? "id\tlon\tlat\n" : "id\tx\ty\n", f);
+    fputs(o.dims == 3 ? "id\tx\ty\tz\n" : o.sphere ? "id\tlon\tlat\n" : "id\tx\ty\n", f);
     for (int64_t i = 0; i < N; i++) {
         fwrite(d.ids.data() + d.idoff[i], 1, d.idoff[i + 1] - d.idoff[i], f);
-        fprintf(f, "\t%.4f\t%.4f\n", Yo[i].x, Yo[i].y);
+        if (o.dims == 3) fprintf(f, "\t%.4f\t%.4f\t%.4f\n", Yo3[i].x, Yo3[i].y, Yo3[i].z);
+        else fprintf(f, "\t%.4f\t%.4f\n", Yo[i].x, Yo[i].y);
     }
     fclose(f);
     LOG("wrote %s", o.out.c_str());
