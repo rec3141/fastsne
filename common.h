@@ -204,20 +204,37 @@ static void parse_unit(const std::string& path, const Unit& u, int* Dp, std::ato
 
 static bool is_fsb(const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".fsb") == 0; }
 
-// binary input written by tools/duckdb_export.py: "FSB1", int32 D, int64 N, N*D float32, ids joined by '\n'
+// binary input: "FSB1", int32 D, int64 N, N*D float32, ids joined by '\n' (tools/duckdb_export.py), or "FSB2", the
+// same with uint16 values (whole-number counts, half the size; tools/fsb_u16.py, --write-fsb, earthdna gtdb_prep.py)
+static int fsb_value_bytes(const char* mg) { return !memcmp(mg, "FSB1", 4) ? 4 : !memcmp(mg, "FSB2", 4) ? 2 : 0; }
+
+// bytes the file's rows take once read as float32 (FSB2 doubles), for batching by memory
+static int64_t input_mem_bytes(const std::string& path, int64_t file_bytes) {
+    if (path.size() <= 4 || path.compare(path.size() - 4, 4, ".fsb") != 0) return file_bytes;
+    char mg[4] = {0};
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f) { if (fread(mg, 1, 4, f) != 4) mg[0] = 0; fclose(f); }
+    return fsb_value_bytes(mg) == 2 ? 2 * file_bytes : file_bytes;
+}
+
 static void parse_fsb(const std::string& path, std::atomic<int>* Dset, double sample, uint64_t seed, int unit_id, UnitResult& R) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return; }
     char mg[4]; int32_t D; int64_t N;
-    if (fread(mg, 1, 4, f) != 4 || memcmp(mg, "FSB1", 4) || fread(&D, 4, 1, f) != 1 || fread(&N, 8, 1, f) != 1) {
-        fprintf(stderr, "%s: not an FSB1 file\n", path.c_str()); fclose(f); return;
+    int vb = 0;
+    if (fread(mg, 1, 4, f) != 4 || !(vb = fsb_value_bytes(mg)) || fread(&D, 4, 1, f) != 1 || fread(&N, 8, 1, f) != 1) {
+        fprintf(stderr, "%s: not an FSB1/FSB2 file\n", path.c_str()); fclose(f); return;
     }
     int expected = 0;
     if (!Dset->compare_exchange_strong(expected, D) && expected != D) {
         fprintf(stderr, "%s has %d columns, expected %d; skipped\n", path.c_str(), D, expected); fclose(f); return;
     }
-    std::vector<float> X((size_t)N * D);
-    if (fread(X.data(), 4, X.size(), f) != X.size()) { fprintf(stderr, "%s truncated\n", path.c_str()); fclose(f); return; }
+    std::vector<float> X;
+    std::vector<uint16_t> X16;
+    if (vb == 4) X.resize((size_t)N * D); else X16.resize((size_t)N * D);
+    if (vb == 4 ? fread(X.data(), 4, X.size(), f) != X.size() : fread(X16.data(), 2, X16.size(), f) != X16.size()) {
+        fprintf(stderr, "%s truncated\n", path.c_str()); fclose(f); return;
+    }
     std::vector<char> ids;
     char buf[1 << 16]; size_t r;
     while ((r = fread(buf, 1, sizeof buf, f)) > 0) ids.insert(ids.end(), buf, buf + r);
@@ -233,7 +250,8 @@ static void parse_fsb(const std::string& path, std::atomic<int>* Dset, double sa
         if (keep) {
             R.ids.insert(R.ids.end(), ids.begin() + p, ids.begin() + e);
             R.idlen.push_back((uint32_t)(e - p));
-            R.vals.insert(R.vals.end(), X.begin() + (size_t)i * D, X.begin() + (size_t)(i + 1) * D);
+            if (vb == 4) R.vals.insert(R.vals.end(), X.begin() + (size_t)i * D, X.begin() + (size_t)(i + 1) * D);
+            else R.vals.insert(R.vals.end(), X16.begin() + (size_t)i * D, X16.begin() + (size_t)(i + 1) * D);
             R.rows++;
         }
         p = e + 1;
@@ -602,17 +620,29 @@ static void parse_args(int argc, char** argv, Opts& o) {
     if (o.nprobe > 0) o.nprobe = std::max(1, std::min(o.nprobe, 64));
 }
 
-// all parsed rows -> one .fsb file (same layout tools/duckdb_export.py writes)
+// all parsed rows -> one .fsb file: FSB2 (uint16) when every value is a whole number in 0..65535, so nothing is
+// lost, else FSB1 (float32)
 static void write_fsb_file(const Data& d, const std::string& path) {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "cannot write %s\n", path.c_str()); exit(1); }
     int32_t D = d.D; int64_t N = d.N;
-    wr(f, "FSB1", 4); wr(f, &D, 4); wr(f, &N, 8);
-    for (const auto& c : d.chunks) wr(f, c.data(), c.size() * 4);
+    bool u16 = true;
+    for (const auto& c : d.chunks) {
+        for (float v : c) if (!(v >= 0.f && v <= 65535.f && v == floorf(v))) { u16 = false; break; }
+        if (!u16) break;
+    }
+    wr(f, u16 ? "FSB2" : "FSB1", 4); wr(f, &D, 4); wr(f, &N, 8);
+    std::vector<uint16_t> h;
+    for (const auto& c : d.chunks) {
+        if (!u16) { wr(f, c.data(), c.size() * 4); continue; }
+        h.resize(c.size());
+        for (size_t t = 0; t < c.size(); t++) h[t] = (uint16_t)c[t];
+        wr(f, h.data(), h.size() * 2);
+    }
     for (int64_t i = 0; i < N; i++) {
         wr(f, d.ids.data() + d.idoff[i], d.idoff[i + 1] - d.idoff[i]);
         if (i + 1 < N) wr(f, "\n", 1);
     }
     fclose(f);
-    LOG("wrote %s (%lld rows)", path.c_str(), (long long)N);
+    LOG("wrote %s (%lld rows, %s)", path.c_str(), (long long)N, u16 ? "FSB2 uint16" : "FSB1 float32");
 }

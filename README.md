@@ -24,8 +24,11 @@ make install PREFIX=/usr/local      # binaries, plus viewer.html and tools/ unde
 python3 render.py tsne.tsv tsne.png --color labels.tsv --cat                 # quick PNG
 ```
 
-Input: TSV rows `id<TAB>f1<TAB>f2...` (header lines skipped), or `.fsb` binary files from
-`tools/duckdb_export.py` (raw float32, no parsing). Output: `id x y` in input order.
+Input: TSV rows `id<TAB>f1<TAB>f2...` (header lines skipped), or `.fsb` binary files (no parsing): `FSB1`
+(float32 values, from `tools/duckdb_export.py`) or `FSB2` (uint16 values, half the size, for whole-number count
+tables such as k-mer counts). Both are `magic, int32 D, int64 N, N x D values, ids joined by '\n'`.
+`tools/fsb_u16.py IN.fsb OUT.fsb` converts a count table to FSB2 (it refuses anything that is not a whole number
+in 0..65535), and `--write-fsb` writes FSB2 whenever that holds. Output: `id x y` in input order.
 
 ```
 # danaSeq: export TNF + kraken taxon from every dana.duckdb (run in the dana-tools env, which has duckdb + numpy)

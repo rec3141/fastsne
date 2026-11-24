@@ -1335,8 +1335,9 @@ static void run_project_cpu(const Opts& o) {
     double acc = 0;
     for (auto& fn : files) {
         struct stat st; if (stat(fn.c_str(), &st) != 0) { fprintf(stderr, "cannot stat %s\n", fn.c_str()); exit(1); }
-        if (acc > 0 && acc + st.st_size > o.batch_gb * 1e9) { batches.emplace_back(); acc = 0; }
-        batches.back().push_back(fn); acc += st.st_size;
+        int64_t mb = input_mem_bytes(fn, st.st_size);
+        if (acc > 0 && acc + mb > o.batch_gb * 1e9) { batches.emplace_back(); acc = 0; }
+        batches.back().push_back(fn); acc += mb;
     }
     FILE* f = fopen(o.out.c_str(), "w");
     if (!f) { fprintf(stderr, "cannot write %s\n", o.out.c_str()); exit(1); }
